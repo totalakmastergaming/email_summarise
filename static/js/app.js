@@ -337,6 +337,10 @@ function saveLocalState(){
 }
 
 function applyLocalState(){
+  /* Only starred/read are restored from localStorage. Archived/trashed
+     are NOT restored: the backend now filters those out server-side
+     (/api/mails excludes them), so a stale local flag could only hide
+     mail that is actually still in the Gmail inbox. */
   try {
     var raw = localStorage.getItem("inboxcura_mail_state");
     if(!raw) return;
@@ -344,8 +348,6 @@ function applyLocalState(){
     MAILS.forEach(function(m){
       if(s.starred && s.starred[m.id] !== undefined) m.starred = !!s.starred[m.id];
       if(s.read && s.read[m.id] !== undefined) m.unread = !s.read[m.id];
-      if(s.archived && s.archived[m.id] !== undefined) m.archived = !!s.archived[m.id];
-      if(s.trashed && s.trashed[m.id] !== undefined) m.trashed = !!s.trashed[m.id];
     });
   } catch(e){}
 }
