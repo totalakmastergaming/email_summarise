@@ -50,6 +50,13 @@ class TiDBConnectionPool:
             ssl={"ssl_mode": "VERIFY_IDENTITY"},
             cursorclass=pymysql.cursors.DictCursor,
             connect_timeout=10,
+            # A cold TiDB Serverless cluster can accept the TCP connection
+            # and then stall before the handshake / first query reply. Without
+            # these, that stall blocks forever (no exception, no log) and the
+            # app never finishes starting — Render then loops on "No open
+            # ports detected". Bound every phase to 10s so a stall fails fast.
+            read_timeout=10,
+            write_timeout=10,
             autocommit=False
         )
 
@@ -123,8 +130,13 @@ def mask_api_key(key: str) -> str:
         return "****"
     return f"{key[:6]}...{key[-4:]}"
 
-def init_db():
-    """Initialize and migrate required tables in TiDB."""
+def init_db() -> bool:
+    """Initialize and migrate required tables in TiDB.
+
+    Returns True when the schema is verified, False when the database could
+    not be reached (caller may retry). Never raises: startup must not die
+    on a cold/unreachable database — see main.py lifespan.
+    """
     try:
         with get_db_cursor(commit=True) as cur:
             # 1. Processed emails deduplication & inbox state table
@@ -270,8 +282,10 @@ def init_db():
                 logger.info("Seeded primary Gemini API key into api_keys table.")
 
         logger.info("TiDB schema verified and tables initialized successfully.")
+        return True
     except Exception as e:
         logger.warning(f"Could not connect to TiDB during init (check credentials): {e}")
+        return False
 
 # ================= Inbox Synchronization & Emails =================
 

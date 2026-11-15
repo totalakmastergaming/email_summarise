@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -59,10 +60,39 @@ async def background_scheduler():
         except Exception as e:
             logger.error(f"Scheduler loop exception: {e}")
 
+def _init_db_with_retries():
+    """Initialize the DB in a background thread, retrying a cold database.
+
+    Runs off the event loop so a stalled first connection can never block
+    startup (see lifespan below). Retries 4 times, 15s apart: a TiDB
+    Serverless cluster that scaled to zero needs time to resume, and the
+    first attempt can fail while it wakes up.
+    """
+    for attempt in range(1, 5):
+        try:
+            if init_db():
+                logger.info("Database initialized.")
+                return
+        except Exception as e:
+            logger.warning(f"Database init attempt {attempt}/4 raised: {e}")
+        if attempt < 4:
+            logger.warning(f"Database init attempt {attempt}/4 failed; retrying in 15s...")
+            time.sleep(15)
+    logger.error("Database init failed after 4 attempts; API routes needing the DB will fail until it recovers.")
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Starting up InboxCura AI service...")
-    init_db()
+    # NEVER block startup on the database. init_db() used to run here
+    # synchronously: when TiDB was cold, the first connection stalled with
+    # no error and no log, uvicorn never printed "Application startup
+    # complete", and Render looped on "No open ports detected" — killing
+    # three deploys in a row. Now the app binds its port and answers
+    # /health immediately; the DB initializes in a background thread and
+    # retries on its own. API calls needing the DB fail gracefully until
+    # it is up.
+    loop = asyncio.get_running_loop()
+    loop.run_in_executor(None, _init_db_with_retries)
     scheduler_task = asyncio.create_task(background_scheduler())
     yield
     logger.info("Shutting down...")
