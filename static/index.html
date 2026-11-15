@@ -1,0 +1,562 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="color-scheme" content="light dark" />
+<link rel="icon" href="data:," />
+<title>InboxCura</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Roboto:wght@400;500;700&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="css/style.css" />
+</head>
+<body>
+<div class="app">
+
+  <!-- ============ SIDEBAR ============ -->
+  <div class="nav-scrim" id="navScrim"></div>
+  <aside class="sidebar" id="sidebar" aria-label="Main navigation">
+    <div class="brand">
+      <img src="assets/logo-lockup.png" alt="InboxCura" height="34" onerror="this.src='assets/logo-lockup.svg'" />
+      <p class="brand-sub">Your inbox, curated.</p>
+    </div>
+    <div class="compose-wrap">
+      <button class="btn-compose" id="composeBtn">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.8 2.8 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/></svg>
+        Compose
+      </button>
+    </div>
+    <nav class="nav">
+      <div class="nav-label">Menu</div>
+      <button class="nav-item active" data-view="dashboard">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="9" rx="1"/><rect x="14" y="3" width="7" height="5" rx="1"/><rect x="14" y="12" width="7" height="9" rx="1"/><rect x="3" y="16" width="7" height="5" rx="1"/></svg>
+        Dashboard
+      </button>
+      <button class="nav-item" data-view="inbox">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-6l-2 3h-4l-2-3H2"/><path d="M5.5 5.1 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.5-6.9A2 2 0 0 0 16.7 4H7.3a2 2 0 0 0-1.8 1.1Z"/></svg>
+        Inbox
+        <span class="count" id="navUnread">0</span>
+      </button>
+      <button class="nav-item" data-view="assistant">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9Z"/><path d="M19 15.5l.8 2.2 2.2.8-2.2.8-.8 2.2-.8-2.2-2.2-.8 2.2-.8Z"/></svg>
+        AI Assistant
+      </button>
+      <button class="nav-item" data-view="config">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg>
+        Config
+      </button>
+      <button class="nav-item" data-view="api-keys">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/></svg>
+        API Keys
+      </button>
+      <div class="nav-label">Folders</div>
+      <button class="nav-item" data-filter-jump="starred">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2.5l2.9 6 6.6.9-4.8 4.6 1.2 6.5L12 17.4l-5.9 3.1 1.2-6.5L2.5 9.4l6.6-.9Z"/></svg>
+        Starred
+      </button>
+      <button class="nav-item" data-filter-jump="urgent">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>
+        Urgent
+        <span class="count hot" id="navUrgent">0</span>
+      </button>
+      <button class="nav-item" data-view="inbox">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2 11 13"/><path d="M22 2 15 22l-4-9-9-4Z"/></svg>
+        Sent
+      </button>
+    </nav>
+    <div class="sidebar-foot">
+      <div class="foot-note"><b class="num" style="color:#fff">9.3 GB</b> of 15 GB used</div>
+      <div class="meter"><i></i></div>
+      <div class="user-row">
+        <div class="avatar" id="userAvatar">AI</div>
+        <div class="who"><b id="userName">Executive User</b><span id="userEmail">Loading...</span></div>
+      </div>
+    </div>
+  </aside>
+
+  <!-- ============ MAIN ============ -->
+  <div class="main">
+    <header class="topbar">
+      <button class="icon-btn only-mobile" id="menuBtn" aria-label="Open menu">
+        <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
+      </button>
+      <label class="search">
+        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+        <input id="searchInput" type="search" placeholder="Search mail" autocomplete="off" />
+      </label>
+      <div class="spacer"></div>
+      <span class="tag" id="topModelTag" style="font-size:11px;padding:4px 10px;border-radius:6px;background:var(--accent-soft);color:var(--accent-text);font-weight:600;margin-right:8px;">gemini-3.5-flash</span>
+      <span class="date-chip" id="currentDateChip">Today</span>
+    </header>
+
+    <div class="content">
+
+      <!-- ======== DASHBOARD ======== -->
+      <section class="view active" id="view-dashboard">
+        <div class="page-head">
+          <div>
+            <h1 id="greetingTitle">Executive Briefing</h1>
+            <p id="greetingSub">Here is what needs your attention today.</p>
+          </div>
+          <div style="display:flex;gap:8px;align-items:center;">
+            <button class="btn primary" id="syncLiveBtn" style="display:flex;align-items:center;gap:6px">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/><path d="M16 21h5v-5"/></svg>
+              <span>Sync Gmail</span>
+            </button>
+            <button class="btn" id="markAllBtn">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
+              Mark all as read
+            </button>
+          </div>
+        </div>
+
+        <!-- Stats: two per row -->
+        <div class="grid-2" style="margin-bottom:14px">
+          <div class="stat">
+            <div class="stat-top">
+              <span class="stat-label">Unread mail</span>
+              <span class="stat-ic violet"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="m22 7-10 6L2 7"/></svg></span>
+            </div>
+            <div class="stat-value num" id="statUnread">0</div>
+            <div class="stat-sub"><b class="down" id="statUnreadSub"></b></div>
+          </div>
+          <div class="stat">
+            <div class="stat-top">
+              <span class="stat-label">Mail received today</span>
+              <span class="stat-ic"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-6l-2 3h-4l-2-3H2"/><path d="M5.5 5.1 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.5-6.9A2 2 0 0 0 16.7 4H7.3a2 2 0 0 0-1.8 1.1Z"/></svg></span>
+            </div>
+            <div class="stat-value num" id="statToday">0</div>
+            <div class="stat-sub" id="statTodaySub"></div>
+          </div>
+          <div class="stat">
+            <div class="stat-top">
+              <span class="stat-label">Urgent mail</span>
+              <span class="stat-ic red"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg></span>
+            </div>
+            <div class="stat-value num" id="statUrgent">0</div>
+            <div class="stat-sub" id="statUrgentSub"></div>
+          </div>
+          <div class="stat">
+            <div class="stat-top">
+              <span class="stat-label">Awaiting your reply</span>
+              <span class="stat-ic amber"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 17-5-5 5-5"/><path d="M20 18v-2a4 4 0 0 0-4-4H4"/></svg></span>
+            </div>
+            <div class="stat-value num" id="statReply">0</div>
+            <div class="stat-sub" id="statReplySub"></div>
+          </div>
+        </div>
+
+        <!-- Two panels per row on desktop, stacked on phones -->
+        <div class="grid-2 grid-panels" style="margin-bottom:14px">
+          <div class="panel">
+            <div class="panel-head">
+              <h2>Urgent — handle first</h2>
+              <button class="link" data-goto="inbox" data-goto-filter="urgent">View all</button>
+            </div>
+            <div class="panel-body"><div id="urgentList"></div></div>
+          </div>
+          <div class="panel">
+            <div class="panel-head">
+              <h2>AI brief for today</h2>
+              <button class="link" data-goto="assistant">Ask assistant</button>
+            </div>
+            <div class="panel-body ai-brief">
+              <p id="aiBriefText"></p>
+              <ul class="ai-points" id="aiBriefPoints"></ul>
+            </div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head">
+            <h2>Recent mail</h2>
+            <button class="link" data-goto="inbox">Open inbox</button>
+          </div>
+          <div class="mail-list" id="recentList"></div>
+        </div>
+      </section>
+
+      <!-- ======== INBOX (Gmail-style) ======== -->
+      <section class="view" id="view-inbox">
+        <div class="gmail">
+          <!-- List mode -->
+          <div id="gmailList">
+            <div class="gm-toolbar" id="gmBarMain">
+              <div class="gm-selectwrap">
+                <button class="gm-check" id="gmMaster" aria-label="Select all conversations"><span class="box"><svg viewBox="0 0 24 24"><path d="M9 16.17 4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/></svg></span></button>
+                <button class="gm-tbtn gm-caret" id="gmCaret" aria-label="Selection options"><svg viewBox="0 0 24 24"><path d="M7 10l5 5 5-5z"/></svg></button>
+                <div class="gm-menu" id="gmSelectMenu">
+                  <button data-selmenu="all">All</button>
+                  <button data-selmenu="none">None</button>
+                  <button data-selmenu="read">Read</button>
+                  <button data-selmenu="unread">Unread</button>
+                  <button data-selmenu="starred">Starred</button>
+                  <button data-selmenu="unstarred">Unstarred</button>
+                </div>
+              </div>
+              <button class="gm-tbtn" id="gmRefresh" aria-label="Refresh"><svg viewBox="0 0 24 24"><path d="M17.65 6.35C16.2 4.9 14.21 4 12 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08c-.82 2.33-3.04 4-5.65 4-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></svg></button>
+              <div class="gm-selectwrap">
+                <button class="gm-tbtn" id="gmMore" aria-label="More actions"><svg viewBox="0 0 24 24"><path d="M12 8c1.1 0 2-.9 2-2s-.9-2-2-2-2 .9-2 2 .9 2 2 2zm0 2c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm0 6c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2z"/></svg></button>
+                <div class="gm-menu" id="gmMoreMenu">
+                  <button data-moremenu="markall">Mark all as read</button>
+                  <button data-moremenu="selectall">Select all conversations</button>
+                </div>
+              </div>
+              <div class="gm-range"><span id="gmRange"></span>
+                <button class="gm-tbtn" disabled aria-label="Newer"><svg viewBox="0 0 24 24"><path d="M15.41 7.41 14 6l-6 6 6 6 1.41-1.41L10.83 12z"/></svg></button>
+                <button class="gm-tbtn" disabled aria-label="Older"><svg viewBox="0 0 24 24"><path d="M10 6 8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z"/></svg></button>
+              </div>
+            </div>
+            <div class="gm-toolbar" id="gmBarSel" hidden>
+              <button class="gm-check on" id="gmMaster2" aria-label="Deselect all"><span class="box"><svg viewBox="0 0 24 24"><path d="M9 16.17 4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/></svg></span></button>
+              <button class="gm-tbtn" data-selact="archive" aria-label="Archive"><svg viewBox="0 0 24 24"><path d="M20.54 5.23l-1.39-1.68C18.88 3.21 18.47 3 18 3H6c-.47 0-.88.21-1.15.55L3.46 5.23C3.17 5.57 3 6.02 3 6.5V19c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V6.5c0-.48-.17-.93-.46-1.27zM12 17.5 6.5 12H10v-2h4v2h3.5L12 17.5zM19 5H5v-.5l1-1h12l1 1V5z"/></svg></button>
+              <button class="gm-tbtn" data-selact="spam" aria-label="Report spam"><svg viewBox="0 0 24 24"><path d="M23 12l-2.44-2.78.34-3.68-3.61-.82-1.89-3.18L12 3 9.81 5.54 7.92 8.72l-3.61.81.34 3.68L2 12l2.44 2.78-.34 3.69 3.61.82 1.89 3.18L12 21l2.19-2.54 1.89-3.18 3.61-.82-.34-3.68L23 12zm-12.9 4.73H9.1v-2h1.99v2zm2-3.07H9.1V6.34h2.98v7.32z"/></svg></button>
+              <button class="gm-tbtn" data-selact="trash" aria-label="Delete"><svg viewBox="0 0 24 24"><path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/></svg></button>
+              <span class="gm-sep"></span>
+              <button class="gm-tbtn" data-selact="read" aria-label="Mark as read"><svg viewBox="0 0 24 24"><path d="M21.99 8c0-.72-.37-1.35-.94-1.7L12 1 2.95 6.3C2.38 6.65 2 7.28 2 8v10c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8zM12 13 3.74 7.84 12 3l8.26 4.84L12 13z"/></svg></button>
+              <button class="gm-tbtn" data-selact="snooze" aria-label="Snooze"><svg viewBox="0 0 24 24"><path d="M11.99 2C6.47 2 2 6.48 2 12s4.47 10 9.99 10C17.52 22 22 17.52 22 12S17.52 2 11.99 2zM12 20c-4.42 0-8-3.58-8-8s3.58-8 8-8 8 3.58 8 8-3.58 8-8 8zm.5-13H11v6l5.25 3.15.75-1.23-4.5-2.67V7z"/></svg></button>
+              <span class="gm-sep"></span>
+              <button class="gm-tbtn" data-selact="label" aria-label="Labels"><svg viewBox="0 0 24 24"><path d="M17.63 5.84C17.27 5.33 16.67 5 16 5L5 5.01C3.9 5.01 3 5.9 3 7v10c0 1.1.9 1.99 2 1.99L16 19c.67 0 1.27-.33 1.63-.84L22 12l-4.37-6.16zM16 17H5V7h11l3.55 5L16 17z"/><circle cx="7.5" cy="12.5" r="1.5"/></svg></button>
+              <div class="gm-range"><span id="gmRange2"></span></div>
+            </div>
+            <div class="gm-tabs" id="gmTabs">
+              <button class="gm-tab active" data-cat="primary"><svg viewBox="0 0 24 24"><path d="M19 3H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm0 12h-4c0 1.66-1.34 3-3 3s-3-1.34-3-3H5V5h14v10z"/></svg><span class="gm-tab-name">Primary</span></button>
+              <button class="gm-tab" data-cat="social"><svg viewBox="0 0 24 24"><path d="M16 11c1.66 0 2.99-1.34 2.99-3S17.66 5 16 5c-1.66 0-3 1.34-3 3s1.34 3 3 3zm-8 0c1.66 0 2.99-1.34 2.99-3S9.66 5 8 5C6.34 5 5 6.34 5 8s1.34 3 3 3zm0 2c-2.33 0-7 1.17-7 3.5V19h14v-2.5c0-2.33-4.67-3.5-7-3.5zm8 0c-.29 0-.62.02-.97.05 1.16.84 1.97 1.97 1.97 3.45V19h6v-2.5c0-2.33-4.67-3.5-7-3.5z"/></svg><span class="gm-tab-name">Social</span><span class="gm-new social" id="gmNewSocial" hidden></span></button>
+              <button class="gm-tab" data-cat="promotions"><svg viewBox="0 0 24 24"><path d="M21.41 11.58l-9-9C12.05 2.22 11.55 2 11 2H4c-1.1 0-2 .9-2 2v7c0 .55.22 1.05.59 1.42l9 9c.36.36.86.58 1.41.58.55 0 1.05-.22 1.41-.59l7-7c.37-.36.59-.86.59-1.41 0-.55-.23-1.06-.59-1.42zM5.5 7C4.67 7 4 6.33 4 5.5S4.67 4 5.5 4 7 4.67 7 5.5 6.33 7 5.5 7z"/></svg><span class="gm-tab-name">Promotions</span><span class="gm-new promo" id="gmNewPromo" hidden></span></button>
+            </div>
+            <div class="gm-filterbar" id="gmFilterBar" hidden>
+              <span id="gmFilterText"></span>
+              <button id="gmFilterClear">Clear filter</button>
+            </div>
+            <div id="inboxList"></div>
+            <div class="gm-foot">
+              <span>9.3 GB of 15 GB used</span>
+              <span>Last account activity: 6:42 PM</span>
+            </div>
+          </div>
+          <!-- Reading mode -->
+          <div id="gmailRead" hidden>
+            <div class="gm-toolbar">
+              <button class="gm-tbtn" id="gmBack" aria-label="Back to inbox"><svg viewBox="0 0 24 24"><path d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z"/></svg></button>
+              <span class="gm-sep"></span>
+              <button class="gm-tbtn" id="gmReadArchive" aria-label="Archive"><svg viewBox="0 0 24 24"><path d="M20.54 5.23l-1.39-1.68C18.88 3.21 18.47 3 18 3H6c-.47 0-.88.21-1.15.55L3.46 5.23C3.17 5.57 3 6.02 3 6.5V19c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V6.5c0-.48-.17-.93-.46-1.27zM12 17.5 6.5 12H10v-2h4v2h3.5L12 17.5zM19 5H5v-.5l1-1h12l1 1V5z"/></svg></button>
+              <button class="gm-tbtn" id="gmReadSpam" aria-label="Report spam"><svg viewBox="0 0 24 24"><path d="M23 12l-2.44-2.78.34-3.68-3.61-.82-1.89-3.18L12 3 9.81 5.54 7.92 8.72l-3.61.81.34 3.68L2 12l2.44 2.78-.34 3.69 3.61.82 1.89 3.18L12 21l2.19-2.54 1.89-3.18 3.61-.82-.34-3.68L23 12zm-12.9 4.73H9.1v-2h1.99v2zm2-3.07H9.1V6.34h2.98v7.32z"/></svg></button>
+              <button class="gm-tbtn" id="gmReadTrash" aria-label="Delete"><svg viewBox="0 0 24 24"><path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/></svg></button>
+              <span class="gm-sep"></span>
+              <button class="gm-tbtn" id="gmReadUnread" aria-label="Mark as unread"><svg viewBox="0 0 24 24"><path d="M20 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm0 4-8 5-8-5V6l8 5 8-5v2z"/></svg></button>
+              <button class="gm-tbtn" id="gmReadSnooze" aria-label="Snooze"><svg viewBox="0 0 24 24"><path d="M11.99 2C6.47 2 2 6.48 2 12s4.47 10 9.99 10C17.52 22 22 17.52 22 12S17.52 2 11.99 2zM12 20c-4.42 0-8-3.58-8-8s3.58-8 8-8 8 3.58 8 8-3.58 8-8 8zm.5-13H11v6l5.25 3.15.75-1.23-4.5-2.67V7z"/></svg></button>
+              <span class="gm-sep"></span>
+              <button class="gm-tbtn" id="gmReadLabel" aria-label="Labels"><svg viewBox="0 0 24 24"><path d="M17.63 5.84C17.27 5.33 16.67 5 16 5L5 5.01C3.9 5.01 3 5.9 3 7v10c0 1.1.9 1.99 2 1.99L16 19c.67 0 1.27-.33 1.63-.84L22 12l-4.37-6.16zM16 17H5V7h11l3.55 5L16 17z"/><circle cx="7.5" cy="12.5" r="1.5"/></svg></button>
+              <div class="gm-range"><span id="gmReadRange"></span>
+                <button class="gm-tbtn" id="gmPrev" aria-label="Newer conversation"><svg viewBox="0 0 24 24"><path d="M15.41 7.41 14 6l-6 6 6 6 1.41-1.41L10.83 12z"/></svg></button>
+                <button class="gm-tbtn" id="gmNext" aria-label="Older conversation"><svg viewBox="0 0 24 24"><path d="M10 6 8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z"/></svg></button>
+              </div>
+            </div>
+            <div id="reader"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ======== AI ASSISTANT ======== -->
+      <section class="view" id="view-assistant">
+        <div class="page-head">
+          <div>
+            <h1>AI Assistant</h1>
+            <p>Summaries, priorities and draft replies — from your inbox.</p>
+          </div>
+        </div>
+        <div class="ai-layout">
+          <div class="panel">
+            <div class="chat" id="chatThread"></div>
+            <form class="chat-input" id="chatForm">
+              <input id="chatText" type="text" placeholder="Ask about your mail — try “what is urgent?”" autocomplete="off" />
+              <button class="btn primary" type="submit" style="min-height:44px">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2 11 13"/><path d="M22 2 15 22l-4-9-9-4Z"/></svg>
+                Ask
+              </button>
+            </form>
+          </div>
+          <div class="panel">
+            <div class="panel-head"><h2>Quick actions</h2></div>
+            <div class="panel-body">
+              <div class="quick">
+                <button data-ask="Summarise today's mail">Summarise today's mail<span>A short brief of everything that arrived today</span></button>
+                <button data-ask="What is urgent right now?">What is urgent right now?<span>Deadlines and time-sensitive threads first</span></button>
+                <button data-ask="Which mails are waiting for my reply?">Waiting for my reply<span>Threads where the ball is in your court</span></button>
+                <button data-ask="Draft a reply to the most urgent mail">Draft a reply<span>A ready-to-edit draft for the top urgent mail</span></button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ======== CONFIG ======== -->
+      <section class="view" id="view-config">
+        <div class="page-head">
+          <div>
+            <h1>System Configuration</h1>
+            <p>Automated summary scheduling, delivery preferences, and email date ranges.</p>
+          </div>
+          <div>
+            <button class="btn primary" id="triggerSummaryNowBtn" style="display:flex;align-items:center;gap:6px">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+              <span>Run Summary Now</span>
+            </button>
+          </div>
+        </div>
+
+        <div class="grid-panels" style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px">
+          <!-- Summary Scheduling -->
+          <div class="panel">
+            <div class="panel-head">
+              <h2>Automated Scheduling</h2>
+            </div>
+            <div class="panel-body">
+              <form id="scheduleForm">
+                <div class="form-group" style="flex-direction:row;align-items:center;justify-content:space-between;padding:4px 0 10px;border-bottom:1px solid var(--border)">
+                  <div>
+                    <div style="font-weight:700;font-size:14px">Enable Daily Summary</div>
+                    <div style="font-size:12.5px;color:var(--text-3)">Deliver executive digest automatically on schedule</div>
+                  </div>
+                  <label class="switch">
+                    <input type="checkbox" id="cfgScheduleEnabled" />
+                    <span class="switch-slider"></span>
+                  </label>
+                </div>
+
+                <div class="form-row" style="margin-top:14px">
+                  <div class="form-group">
+                    <label class="form-label" for="cfgScheduleTime">Delivery Time</label>
+                    <input type="time" class="form-input" id="cfgScheduleTime" value="18:00" />
+                  </div>
+                  <div class="form-group">
+                    <label class="form-label" for="cfgScheduleTz">Timezone</label>
+                    <select class="form-select" id="cfgScheduleTz">
+                      <option value="Asia/Kolkata">Asia/Kolkata (IST)</option>
+                      <option value="UTC">UTC (Universal)</option>
+                      <option value="America/New_York">America/New_York (EST)</option>
+                      <option value="America/Los_Angeles">America/Los_Angeles (PST)</option>
+                      <option value="Europe/London">Europe/London (GMT)</option>
+                      <option value="Europe/Paris">Europe/Paris (CET)</option>
+                    </select>
+                  </div>
+                </div>
+
+                <div style="margin-top:14px;display:flex;justify-content:flex-end">
+                  <button type="submit" class="btn primary">Save Schedule</button>
+                </div>
+              </form>
+            </div>
+          </div>
+
+          <!-- Customizable Summary Date Range -->
+          <div class="panel">
+            <div class="panel-head">
+              <h2>Customizable Date Range</h2>
+            </div>
+            <div class="panel-body">
+              <form id="rangeForm">
+                <div class="form-group">
+                  <label class="form-label" for="cfgRangePreset">Inbound Email Window <span>Which emails to analyze</span></label>
+                  <select class="form-select" id="cfgRangePreset">
+                    <option value="last_1_day">Last 1 day (Past 24 hours)</option>
+                    <option value="last_2_days">Last 2 days</option>
+                    <option value="last_3_days">Last 3 days</option>
+                    <option value="last_4_days">Last 4 days</option>
+                    <option value="last_5_days">Last 5 days</option>
+                    <option value="last_6_days">Last 6 days</option>
+                    <option value="last_7_days">Last 7 days (Full Week)</option>
+                    <option value="custom">Custom Date Range</option>
+                  </select>
+                </div>
+
+                <div id="customDateFields" style="display:none;margin-top:10px">
+                  <div class="form-row">
+                    <div class="form-group">
+                      <label class="form-label" for="cfgCustomStart">Start Date</label>
+                      <input type="date" class="form-input" id="cfgCustomStart" />
+                    </div>
+                    <div class="form-group">
+                      <label class="form-label" for="cfgCustomEnd">End Date</label>
+                      <input type="date" class="form-input" id="cfgCustomEnd" />
+                    </div>
+                  </div>
+                </div>
+
+                <div style="margin-top:14px;display:flex;justify-content:flex-end">
+                  <button type="submit" class="btn">Save Range</button>
+                </div>
+              </form>
+            </div>
+          </div>
+        </div>
+
+        <!-- External Cron & Automation Webhook -->
+        <div class="panel" style="margin-bottom:14px">
+          <div class="panel-head">
+            <h2>External Cron Automation (cron-job.org / Render)</h2>
+          </div>
+          <div class="panel-body">
+            <p style="font-size:13.5px;color:var(--text-2);margin:0 0 10px">You can trigger automated summaries on Render or via cron-job.org by setting up a POST webhook targeting:</p>
+            <div class="code-box" id="cronWebhookBox">POST /api/cron-trigger</div>
+            <p style="font-size:12.5px;color:var(--text-3);margin:8px 0 0">Requires Header: <code>Authorization: Bearer &lt;CRON_SECRET&gt;</code></p>
+          </div>
+        </div>
+
+        <!-- Recent Executions Status -->
+        <div class="panel">
+          <div class="panel-head" style="display:flex;align-items:center;justify-content:space-between">
+            <h2>Recent Summary Executions</h2>
+            <button class="btn" id="refreshJobsBtn" style="min-height:32px;padding:4px 10px;font-size:12px">Refresh</button>
+          </div>
+          <div class="panel-body">
+            <div class="table-responsive">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th>Date / Time</th>
+                    <th>Status</th>
+                    <th>Range</th>
+                    <th>Emails</th>
+                    <th>Batches</th>
+                    <th>Urgent</th>
+                  </tr>
+                </thead>
+                <tbody id="summaryJobsTableBody">
+                  <tr><td colspan="6" style="text-align:center;color:var(--text-3);padding:20px">Loading job history...</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ======== API KEYS ======== -->
+      <section class="view" id="view-api-keys">
+        <div class="page-head">
+          <div>
+            <h1>API Key Management</h1>
+            <p>Manage multi-provider AI keys, configure priority failover, and monitor rate limits.</p>
+          </div>
+          <div>
+            <button class="btn primary" id="openAddKeyModalBtn" style="display:flex;align-items:center;gap:6px">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+              <span>Add API Key</span>
+            </button>
+          </div>
+        </div>
+
+        <div class="panel" style="margin-bottom:14px">
+          <div class="panel-head">
+            <h2>Configured AI Provider Keys</h2>
+          </div>
+          <div class="panel-body">
+            <div class="table-responsive">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th>Provider</th>
+                    <th>Label</th>
+                    <th>Key (Masked)</th>
+                    <th>Model</th>
+                    <th>Priority</th>
+                    <th>Status</th>
+                    <th>Requests (Success / Fail)</th>
+                    <th>Actions</th>
+                  </tr>
+                </thead>
+                <tbody id="apiKeysTableBody">
+                  <tr><td colspan="8" style="text-align:center;color:var(--text-3);padding:20px">Loading keys...</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <!-- Failover & Dynamic Workload Architecture -->
+        <div class="panel">
+          <div class="panel-head">
+            <h2>Intelligent Dynamic Failover & Workload Balancing</h2>
+          </div>
+          <div class="panel-body" style="font-size:13.5px;color:var(--text-2);line-height:1.6">
+            <p style="margin:0 0 10px">InboxCura dynamically partitions email inboxes into intelligent batches and assigns them across available keys:</p>
+            <ul style="padding-left:20px;margin:0 0 10px">
+              <li><b>Priority Routing:</b> Keys with Priority 1 are utilized first. Priority 2+ keys act as hot standby failovers.</li>
+              <li><b>Automatic Cooldown (429 Rate Limits):</b> If any key hits a rate limit or quota ceiling, it is temporarily cooled down and failed over seamlessly to the next key.</li>
+              <li><b>Zero Secret Exposure:</b> Raw API keys are never exposed in user responses, client bundles, or system logs.</li>
+            </ul>
+          </div>
+        </div>
+      </section>
+
+    </div>
+  </div>
+</div>
+
+<!-- Compose -->
+<div class="scrim" id="scrim"></div>
+<div class="modal" id="composeModal" role="dialog" aria-label="Compose mail">
+  <div class="modal-head">
+    <h2>New message</h2>
+    <button class="icon-btn" id="composeClose" aria-label="Close compose">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>
+    </button>
+  </div>
+  <form id="composeForm">
+    <input id="cTo" type="email" placeholder="To" autocomplete="off" />
+    <input id="cSubject" type="text" placeholder="Subject" autocomplete="off" />
+    <textarea id="cBody" placeholder="Write your message…"></textarea>
+    <div style="display:flex;gap:8px;flex-wrap:wrap">
+      <button class="btn primary" type="submit">Open in mail app</button>
+      <button class="btn" type="button" id="copyDraft">Copy draft</button>
+    </div>
+  </form>
+</div>
+
+<!-- Add API Key Modal -->
+<div class="modal" id="apiKeyModal" role="dialog" aria-label="Add API Key">
+  <div class="modal-head">
+    <h2>Add AI Provider Key</h2>
+    <button class="icon-btn" id="apiKeyModalClose" aria-label="Close modal">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>
+    </button>
+  </div>
+  <form id="addApiKeyForm">
+    <div class="form-group">
+      <label class="form-label" for="keyProvider">AI Provider</label>
+      <select class="form-select" id="keyProvider">
+        <option value="gemini">Google Gemini</option>
+        <option value="groq">Groq</option>
+        <option value="openai">OpenAI</option>
+      </select>
+    </div>
+    <div class="form-group">
+      <label class="form-label" for="keyLabel">Label / Identification</label>
+      <input type="text" class="form-input" id="keyLabel" placeholder="e.g. Primary Gemini Flash" required />
+    </div>
+    <div class="form-group">
+      <label class="form-label" for="keySecret">API Key</label>
+      <input type="password" class="form-input" id="keySecret" placeholder="Paste your API key here..." autocomplete="new-password" required />
+    </div>
+    <div class="form-row">
+      <div class="form-group">
+        <label class="form-label" for="keyModel">Model Name</label>
+        <input type="text" class="form-input" id="keyModel" value="gemini-3.5-flash" required />
+      </div>
+      <div class="form-group">
+        <label class="form-label" for="keyPriority">Priority (1 = Highest)</label>
+        <input type="number" class="form-input" id="keyPriority" value="1" min="1" max="10" required />
+      </div>
+    </div>
+    <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:10px">
+      <button class="btn" type="button" id="apiKeyModalCancel">Cancel</button>
+      <button class="btn primary" type="submit">Save API Key</button>
+    </div>
+  </form>
+</div>
+<div class="toast" id="toast"></div>
+
+<script src="js/app.js"></script>
+</body>
+</html>

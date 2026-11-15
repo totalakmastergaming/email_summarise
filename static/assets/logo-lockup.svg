@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 170 38" width="170" height="38">
+  <defs>
+    <linearGradient id="lockupGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#8d81ff"/>
+      <stop offset="100%" stop-color="#6357e8"/>
+    </linearGradient>
+  </defs>
+  <!-- Mark icon -->
+  <rect x="0" y="2" width="34" height="34" rx="8" fill="url(#lockupGrad)"/>
+  <path d="M8 12C8 11 9 10 10 10H24C25 10 26 11 26 12V24C26 25 25 26 24 26H10C9 26 8 25 8 24V12Z" fill="none" stroke="#ffffff" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M8 12L17 18L26 12" fill="none" stroke="#ffffff" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M25 6L25.8 8.2L28 9L25.8 9.8L25 12L24.2 9.8L22 9L24.2 8.2Z" fill="#ffdf70"/>
+
+  <!-- Typography -->
+  <text x="44" y="26" font-family="'Manrope', -apple-system, sans-serif" font-size="20" font-weight="800" fill="#ffffff" letter-spacing="-0.5">Inbox<tspan fill="#8d81ff">Cura</tspan></text>
+</svg>

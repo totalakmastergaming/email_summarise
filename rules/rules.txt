@@ -1,0 +1,6 @@
+**Always Works Under Same Folder(email_summarise), do not works outside this folder)
+1.No HardCoding rules(applied throughout the project)
+1. Do Not hardcoded the model of the gemni or any ai model(groq) use .env or database defined with secure implementation and define gemini-3.5-flash for defualt gemniand use groq model default= openai/gpt-oss-120b
+
+2. Use Reuseablity Of Codes(no again and again writing same code)
+3. For UI do not use AI SLOPS ui The Purple-to-Blue Gradient,Uniform Rounded Cards & Hard Shadows,Decorative Grids & Line,Meaningless Corporate Copy(claiming production ready,grade etc), etc...
