@@ -60,17 +60,11 @@
         Urgent
         <span class="count hot" id="navUrgent">0</span>
       </button>
-      <button class="nav-item" data-view="inbox">
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2 11 13"/><path d="M22 2 15 22l-4-9-9-4Z"/></svg>
-        Sent
-      </button>
     </nav>
     <div class="sidebar-foot">
-      <div class="foot-note"><b class="num" style="color:#fff">9.3 GB</b> of 15 GB used</div>
-      <div class="meter"><i></i></div>
       <div class="user-row">
         <div class="avatar" id="userAvatar">AI</div>
-        <div class="who"><b id="userName">Executive User</b><span id="userEmail">Loading...</span></div>
+        <div class="who"><b id="userName">Your account</b><span id="userEmail">Loading…</span></div>
       </div>
     </div>
   </aside>
@@ -83,20 +77,26 @@
       </button>
       <label class="search">
         <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
-        <input id="searchInput" type="search" placeholder="Search mail" autocomplete="off" />
+        <input id="searchInput" type="search" placeholder="Search mail" autocomplete="off" aria-label="Search mail" />
       </label>
       <div class="spacer"></div>
-      <span class="tag" id="topModelTag" style="font-size:11px;padding:4px 10px;border-radius:6px;background:var(--accent-soft);color:var(--accent-text);font-weight:600;margin-right:8px;">gemini-3.5-flash</span>
+      <span class="tag model-tag" id="topModelTag">Loading…</span>
       <span class="date-chip" id="currentDateChip">Today</span>
     </header>
 
     <div class="content">
 
+      <!-- Shown when the API answers 401 (no/wrong token) or 503 (ADMIN_TOKEN not set on the server). -->
+      <div class="auth-notice" id="authNotice" hidden>
+        <span id="authNoticeText">Admin access is locked — enter your admin token to use InboxCura.</span>
+        <button class="btn" id="authNoticeGo" style="min-height:32px;padding:4px 12px;font-size:12.5px">Enter admin token</button>
+      </div>
+
       <!-- ======== DASHBOARD ======== -->
       <section class="view active" id="view-dashboard">
         <div class="page-head">
           <div>
-            <h1 id="greetingTitle">Executive Briefing</h1>
+            <h1 id="greetingTitle">Today’s briefing</h1>
             <p id="greetingSub">Here is what needs your attention today.</p>
           </div>
           <div style="display:flex;gap:8px;align-items:center;">
@@ -217,7 +217,10 @@
               <button class="gm-tbtn" data-selact="read" aria-label="Mark as read"><svg viewBox="0 0 24 24"><path d="M21.99 8c0-.72-.37-1.35-.94-1.7L12 1 2.95 6.3C2.38 6.65 2 7.28 2 8v10c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8zM12 13 3.74 7.84 12 3l8.26 4.84L12 13z"/></svg></button>
               <button class="gm-tbtn" data-selact="snooze" aria-label="Snooze"><svg viewBox="0 0 24 24"><path d="M11.99 2C6.47 2 2 6.48 2 12s4.47 10 9.99 10C17.52 22 22 17.52 22 12S17.52 2 11.99 2zM12 20c-4.42 0-8-3.58-8-8s3.58-8 8-8 8 3.58 8 8-3.58 8-8 8zm.5-13H11v6l5.25 3.15.75-1.23-4.5-2.67V7z"/></svg></button>
               <span class="gm-sep"></span>
-              <button class="gm-tbtn" data-selact="label" aria-label="Labels"><svg viewBox="0 0 24 24"><path d="M17.63 5.84C17.27 5.33 16.67 5 16 5L5 5.01C3.9 5.01 3 5.9 3 7v10c0 1.1.9 1.99 2 1.99L16 19c.67 0 1.27-.33 1.63-.84L22 12l-4.37-6.16zM16 17H5V7h11l3.55 5L16 17z"/><circle cx="7.5" cy="12.5" r="1.5"/></svg></button>
+              <div class="gm-selectwrap">
+                <button class="gm-tbtn" data-selact="label" aria-label="Labels"><svg viewBox="0 0 24 24"><path d="M17.63 5.84C17.27 5.33 16.67 5 16 5L5 5.01C3.9 5.01 3 5.9 3 7v10c0 1.1.9 1.99 2 1.99L16 19c.67 0 1.27-.33 1.63-.84L22 12l-4.37-6.16zM16 17H5V7h11l3.55 5L16 17z"/><circle cx="7.5" cy="12.5" r="1.5"/></svg></button>
+                <div class="gm-menu" id="gmLabelMenu"></div>
+              </div>
               <div class="gm-range"><span id="gmRange2"></span></div>
             </div>
             <div class="gm-tabs" id="gmTabs">
@@ -231,8 +234,7 @@
             </div>
             <div id="inboxList"></div>
             <div class="gm-foot">
-              <span>9.3 GB of 15 GB used</span>
-              <span>Last account activity: 6:42 PM</span>
+              <span id="gmFootCount"></span>
             </div>
           </div>
           <!-- Reading mode -->
@@ -270,7 +272,7 @@
           <div class="panel">
             <div class="chat" id="chatThread"></div>
             <form class="chat-input" id="chatForm">
-              <input id="chatText" type="text" placeholder="Ask about your mail — try “what is urgent?”" autocomplete="off" />
+              <input id="chatText" type="text" placeholder="Ask about your mail — try “what is urgent?”" autocomplete="off" aria-label="Ask the AI assistant about your mail" />
               <button class="btn primary" type="submit" style="min-height:44px">
                 <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2 11 13"/><path d="M22 2 15 22l-4-9-9-4Z"/></svg>
                 Ask
@@ -306,7 +308,7 @@
           </div>
         </div>
 
-        <div class="grid-panels" style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px">
+        <div class="grid-panels config-grid" style="margin-bottom:14px">
           <!-- Summary Scheduling -->
           <div class="panel">
             <div class="panel-head">
@@ -320,7 +322,7 @@
                     <div style="font-size:12.5px;color:var(--text-3)">Deliver executive digest automatically on schedule</div>
                   </div>
                   <label class="switch">
-                    <input type="checkbox" id="cfgScheduleEnabled" />
+                    <input type="checkbox" id="cfgScheduleEnabled" aria-label="Enable daily summary" />
                     <span class="switch-slider"></span>
                   </label>
                 </div>
@@ -404,6 +406,28 @@
           </div>
         </div>
 
+        <!-- Admin Access -->
+        <div class="panel" style="margin-bottom:14px">
+          <div class="panel-head">
+            <h2>Admin Access</h2>
+          </div>
+          <div class="panel-body">
+            <p style="font-size:13.5px;color:var(--text-2);margin:0 0 10px">Every action in this dashboard requires the admin token (ADMIN_TOKEN on the server). Enter it once — it is kept only in this browser tab and is never saved on the server.</p>
+            <form id="adminTokenForm">
+              <div class="form-group" style="margin-bottom:10px">
+                <label class="form-label" for="adminTokenInput">Admin token</label>
+                <input type="password" class="form-input" id="adminTokenInput" placeholder="Paste the ADMIN_TOKEN from Render" autocomplete="off" />
+              </div>
+              <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+                <button type="submit" class="btn primary">Save token for this tab</button>
+                <button type="button" class="btn" id="adminTokenClear">Clear</button>
+                <span id="adminTokenState" style="font-size:12.5px;color:var(--text-3)">No token saved in this tab.</span>
+              </div>
+            </form>
+            <p style="font-size:12.5px;color:var(--text-3);margin:10px 0 0">The token is generated in Render (env var ADMIN_TOKEN). Copy it from the Render dashboard → Environment. If the server has no ADMIN_TOKEN set, the API answers 503 and nothing here will load.</p>
+          </div>
+        </div>
+
         <!-- Recent Executions Status -->
         <div class="panel">
           <div class="panel-head" style="display:flex;align-items:center;justify-content:space-between">
@@ -477,14 +501,14 @@
         <!-- Failover & Dynamic Workload Architecture -->
         <div class="panel">
           <div class="panel-head">
-            <h2>Intelligent Dynamic Failover & Workload Balancing</h2>
+            <h2>Failover &amp; workload</h2>
           </div>
           <div class="panel-body" style="font-size:13.5px;color:var(--text-2);line-height:1.6">
-            <p style="margin:0 0 10px">InboxCura dynamically partitions email inboxes into intelligent batches and assigns them across available keys:</p>
+            <p style="margin:0 0 10px">Mail is split into batches and sent to your keys in priority order:</p>
             <ul style="padding-left:20px;margin:0 0 10px">
-              <li><b>Priority Routing:</b> Keys with Priority 1 are utilized first. Priority 2+ keys act as hot standby failovers.</li>
-              <li><b>Automatic Cooldown (429 Rate Limits):</b> If any key hits a rate limit or quota ceiling, it is temporarily cooled down and failed over seamlessly to the next key.</li>
-              <li><b>Zero Secret Exposure:</b> Raw API keys are never exposed in user responses, client bundles, or system logs.</li>
+              <li><b>Priority order:</b> Priority 1 keys are used first. Priority 2 and lower are standby if a higher-priority key is unavailable.</li>
+              <li><b>Rate-limit cooldown:</b> If a key returns a rate-limit error (429), it is paused for a while and the next key is used instead.</li>
+              <li><b>Masked keys:</b> Only masked key values are shown here. Full keys are stored server-side.</li>
             </ul>
           </div>
         </div>
@@ -504,9 +528,9 @@
     </button>
   </div>
   <form id="composeForm">
-    <input id="cTo" type="email" placeholder="To" autocomplete="off" />
-    <input id="cSubject" type="text" placeholder="Subject" autocomplete="off" />
-    <textarea id="cBody" placeholder="Write your message…"></textarea>
+    <input id="cTo" type="email" placeholder="To" autocomplete="off" aria-label="Recipient" />
+    <input id="cSubject" type="text" placeholder="Subject" autocomplete="off" aria-label="Subject" />
+    <textarea id="cBody" placeholder="Write your message…" aria-label="Message"></textarea>
     <div style="display:flex;gap:8px;flex-wrap:wrap">
       <button class="btn primary" type="submit">Open in mail app</button>
       <button class="btn" type="button" id="copyDraft">Copy draft</button>

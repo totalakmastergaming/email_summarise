@@ -39,29 +39,69 @@ class TransientServerError(LLMProviderError):
     """Raised on temporary server 5xx errors or network timeouts."""
     pass
 
+def parse_json_response(text: str) -> dict:
+    """Parse an LLM JSON reply, tolerating ```json fenced blocks.
+
+    Gemini (``response_mime_type="application/json"``) and Groq
+    (``response_format={"type": "json_object"}``) should return raw JSON,
+    but models still sometimes wrap it in a markdown fence, which made
+    whole batches fail permanently. One shared helper, used by the
+    pipeline and llm_service, instead of each caller re-trying json.loads.
+    """
+    if not text:
+        raise ValueError("Empty LLM response.")
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        # Strip opening fence (``` or ```json) and closing fence.
+        first_newline = cleaned.find("\n")
+        cleaned = cleaned[first_newline + 1:] if first_newline != -1 else cleaned[3:]
+        if cleaned.rstrip().endswith("```"):
+            cleaned = cleaned.rstrip()[:-3]
+        cleaned = cleaned.strip()
+    return json.loads(cleaned)
+
+
 def call_gemini(api_key: str, model_name: str, prompt: str, is_json: bool = False) -> str:
     """Direct invocation for Google Gemini models via google-genai SDK."""
     try:
-        client = genai.Client(api_key=api_key)
+        # 60s HTTP timeout: previously there was NO timeout at all, so a
+        # hung Gemini call could block a Render worker thread indefinitely.
+        client = genai.Client(
+            api_key=api_key,
+            http_options=types.HttpOptions(timeout=60_000),
+        )
         config_args = {"temperature": 0.2}
         if is_json:
             config_args["response_mime_type"] = "application/json"
-        
+
         response = client.models.generate_content(
             model=model_name or settings.GEMINI_MODEL,
             contents=prompt,
             config=types.GenerateContentConfig(**config_args)
         )
-        return response.text
+        text = response.text
+        if not text:
+            raise LLMProviderError("Gemini returned an empty response.")
+        return text
+    except (QuotaExceededError, InvalidKeyError, ContextWindowExceededError, TransientServerError, LLMProviderError):
+        raise
     except Exception as e:
         err_str = str(e).lower()
         if "429" in err_str or "resource_exhausted" in err_str or "quota" in err_str:
             raise QuotaExceededError(f"Gemini quota/rate limit exceeded: {e}")
         elif "401" in err_str or "403" in err_str or "api_key_invalid" in err_str or "permission_denied" in err_str:
             raise InvalidKeyError(f"Invalid Gemini API key: {e}")
-        elif "context" in err_str or "token" in err_str and "maximum" in err_str:
+        # NOTE: the old check was `"context" in err_str or "token" in
+        # err_str and "maximum" in err_str`. Because `and` binds tighter
+        # than `or`, ANY error mentioning "context" — including a timeout
+        # ("context deadline exceeded") — was misclassified as a context
+        # overflow, which made the pipeline split batches forever instead
+        # of retrying/failing over. Match real overflow phrasing only.
+        elif ("context window" in err_str or "maximum context" in err_str
+              or "exceeds the maximum number of tokens" in err_str
+              or "too many tokens" in err_str or "token limit" in err_str):
             raise ContextWindowExceededError(f"Gemini context window exceeded: {e}")
-        elif "500" in err_str or "503" in err_str or "timeout" in err_str or "unavailable" in err_str:
+        elif "500" in err_str or "503" in err_str or "timeout" in err_str or "unavailable" in err_str or "deadline exceeded" in err_str:
             raise TransientServerError(f"Gemini transient server error: {e}")
         raise LLMProviderError(f"Gemini API error: {e}")
 
@@ -95,7 +135,13 @@ def call_groq(api_key: str, model_name: str, prompt: str, is_json: bool = False)
     try:
         with urllib.request.urlopen(req, timeout=30) as res:
             res_data = json.loads(res.read().decode("utf-8"))
-            return res_data["choices"][0]["message"]["content"]
+            try:
+                content = res_data["choices"][0]["message"]["content"]
+            except (KeyError, IndexError, TypeError):
+                raise LLMProviderError(f"Groq returned an unexpected payload: {str(res_data)[:200]}")
+            if not content:
+                raise LLMProviderError("Groq returned an empty response.")
+            return content
     except urllib.error.HTTPError as e:
         status_code = e.code
         body = e.read().decode("utf-8", errors="ignore")
@@ -105,16 +151,22 @@ def call_groq(api_key: str, model_name: str, prompt: str, is_json: bool = False)
             raise InvalidKeyError(f"Groq invalid API key: {body}")
         elif status_code >= 500:
             raise TransientServerError(f"Groq 5xx server error: {body}")
-        elif "context_length_exceeded" in body or "tokens" in body:
+        elif "context_length_exceeded" in body or "maximum context length" in body:
             raise ContextWindowExceededError(f"Groq context window exceeded: {body}")
         raise LLMProviderError(f"Groq error ({status_code}): {body}")
+    except LLMProviderError:
+        raise  # Malformed/empty payload: not a transient network error.
     except Exception as e:
         raise TransientServerError(f"Network error contacting Groq: {e}")
 
 def call_generic_openai_compatible(api_key: str, model_name: str, prompt: str, endpoint: str = "https://api.openai.com/v1/chat/completions", is_json: bool = False) -> str:
     """Universal OpenAI-compatible provider caller (OpenAI, DeepSeek, Local, etc.)."""
+    if not model_name:
+        # No silent fallback to a hardcoded model (project no-hardcoding
+        # rule): the model must come from the api_keys row / .env.
+        raise LLMProviderError("No model_name configured for this API key.")
     payload = {
-        "model": model_name or "gpt-4o-mini",
+        "model": model_name,
         "messages": [
             {"role": "system", "content": "You are InboxCura AI. Follow all rules strictly and return structured output."},
             {"role": "user", "content": prompt}
@@ -138,7 +190,13 @@ def call_generic_openai_compatible(api_key: str, model_name: str, prompt: str, e
     try:
         with urllib.request.urlopen(req, timeout=35) as res:
             res_data = json.loads(res.read().decode("utf-8"))
-            return res_data["choices"][0]["message"]["content"]
+            try:
+                content = res_data["choices"][0]["message"]["content"]
+            except (KeyError, IndexError, TypeError):
+                raise LLMProviderError(f"Provider returned an unexpected payload: {str(res_data)[:200]}")
+            if not content:
+                raise LLMProviderError("Provider returned an empty response.")
+            return content
     except urllib.error.HTTPError as e:
         status_code = e.code
         body = e.read().decode("utf-8", errors="ignore")
@@ -149,6 +207,8 @@ def call_generic_openai_compatible(api_key: str, model_name: str, prompt: str, e
         elif status_code >= 500:
             raise TransientServerError(f"Provider 5xx error: {body}")
         raise LLMProviderError(f"Provider error ({status_code}): {body}")
+    except LLMProviderError:
+        raise  # Malformed/empty payload: not a transient network error.
     except Exception as e:
         raise TransientServerError(f"Network connection error: {e}")
 

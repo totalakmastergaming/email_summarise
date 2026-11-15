@@ -1,29 +1,27 @@
+"""Legacy LLM helpers, kept for import compatibility.
+
+These used to call Gemini directly — bypassing key rotation, cooldowns,
+Groq failover, timeouts and error classification in
+``app.services.llm_provider`` — and duplicated the prompts already built
+in the pipeline / API layer. They are now thin wrappers over
+``execute_with_failover`` so every LLM call in the app goes through the
+same resilient path. Nothing in the app imports this module today; it is
+kept only so external/older callers do not break.
+"""
 import json
 import logging
-from google import genai
-from google.genai import types
-from app.config import settings
+
+from app.services.llm_provider import execute_with_failover, parse_json_response
 
 logger = logging.getLogger(__name__)
 
-def _get_gemini_client():
-    """Reusable client initialization with configuration check."""
-    if not settings.GEMINI_API_KEY:
-        raise ValueError("GEMINI_API_KEY is not configured in .env.")
-    if not settings.GEMINI_MODEL:
-        raise ValueError("GEMINI_MODEL is not configured in .env. Please define GEMINI_MODEL (e.g. GEMINI_MODEL=gemini-3.5-flash).")
-    return genai.Client(api_key=settings.GEMINI_API_KEY)
 
 def generate_inbox_summary(emails_data: list[dict]) -> dict:
     """
-    Pass raw email metadata to Google Gemini and return structured intelligence:
-    - Executive summary
-    - Urgent action items
-    - Categorized breakdown
-    - Full formatted markdown report
+    Pass raw email metadata to the configured LLM (Gemini default, Groq
+    failover) and return structured intelligence: executive summary, urgent
+    action items, categorized breakdown, full formatted markdown report.
     """
-    client = _get_gemini_client()
-
     prompt = f"""
 You are an elite, discreet personal executive assistant.
 Analyze these {len(emails_data)} emails received today and produce a high-impact, actionable end-of-day briefing.
@@ -53,37 +51,27 @@ Here is the email data:
 {json.dumps(emails_data, indent=2, default=str)}
 """
 
-    logger.info(f"Submitting {len(emails_data)} emails to {settings.GEMINI_MODEL}...")
-
-    response = client.models.generate_content(
-        model=settings.GEMINI_MODEL,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            temperature=0.2
-        )
-    )
+    logger.info(f"Submitting {len(emails_data)} emails for summarisation...")
+    response_text, _key_used = execute_with_failover(prompt, is_json=True)
 
     try:
-        parsed_data = json.loads(response.text)
-        return parsed_data
+        return parse_json_response(response_text)
     except Exception as e:
-        logger.error(f"Failed to parse Gemini JSON output: {e}\nRaw response:\n{response.text}")
+        logger.error(f"Failed to parse LLM JSON output: {e}")
         return {
             "executive_summary": "Today's emails summarized.",
             "urgent_count": 0,
             "action_items": [],
             "categories": {},
-            "email_markdown_report": response.text
+            "email_markdown_report": response_text,
         }
+
 
 def answer_inbox_query(question: str, context_emails: list[dict], latest_summary: str = "") -> str:
     """
     Answers questions asked by the user in the InboxCura AI Assistant view
-    using real inbox context and the model specified in .env.
+    using real inbox context and the configured model (via failover).
     """
-    client = _get_gemini_client()
-
     prompt = f"""
 You are the InboxCura personal email assistant.
 Answer the user's question concisely and accurately based on their current email inbox and today's summary.
@@ -102,9 +90,5 @@ Guidelines:
 - If asked to draft a reply, provide a polished, ready-to-send draft.
 """
 
-    response = client.models.generate_content(
-        model=settings.GEMINI_MODEL,
-        contents=prompt,
-        config=types.GenerateContentConfig(temperature=0.3)
-    )
-    return response.text
+    answer, _key_used = execute_with_failover(prompt, is_json=False)
+    return answer

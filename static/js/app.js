@@ -1,11 +1,64 @@
 /* ================= Data ================= */
 var MAILS = [];
+/* Server search results (null = not searching; MAILS is the pool). */
+var SEARCH_RESULTS = null;
+/* User-created Gmail labels, loaded once per session. */
+var LABELS_CACHE = null;
+
+/* ================= Admin token + API wrapper =================
+   Every /api route requires `Authorization: Bearer <ADMIN_TOKEN>` (see
+   require_admin in app/routes/api.py). The token is kept in
+   sessionStorage only — it never touches localStorage or the server —
+   and is entered once in the Configuration view. apiFetch injects it
+   on every call and surfaces the lock banner on 401/503. */
+function getAdminToken(){ try { return sessionStorage.getItem("inboxcura_admin_token") || ""; } catch(e){ return ""; } }
+function setAdminToken(t){ try { if(t) sessionStorage.setItem("inboxcura_admin_token", t); else sessionStorage.removeItem("inboxcura_admin_token"); } catch(e){} }
+function showAuthNotice(status){
+  var n = $("#authNotice"), tx = $("#authNoticeText");
+  if(!n) return;
+  if(tx) tx.textContent = status === 503
+    ? "The server has no admin token configured (ADMIN_TOKEN is not set in Render) — the API is locked until it is set."
+    : "Admin access is locked — enter your admin token to use InboxCura.";
+  n.hidden = false;
+}
+function hideAuthNotice(){ var n=$("#authNotice"); if(n) n.hidden = true; }
+function apiFetch(url, options){
+  options = options || {};
+  if(url.indexOf("/api/") === 0){
+    options.headers = options.headers || {};
+    var tok = getAdminToken();
+    if(tok) options.headers["Authorization"] = "Bearer " + tok;
+  }
+  return fetch(url, options).then(function(res){
+    if(url.indexOf("/api/") === 0){
+      if(res.status === 401 || res.status === 503) showAuthNotice(res.status);
+      else if(res.ok) hideAuthNotice();
+    }
+    return res;
+  });
+}
+function refreshTokenStateLabel(){
+  var el = $("#adminTokenState");
+  if(el) el.textContent = getAdminToken() ? "Token saved for this tab." : "No token saved in this tab.";
+}
 
 /* ================= Helpers ================= */
 var $ = function(s){ return document.querySelector(s); };
 var $$ = function(s){ return Array.prototype.slice.call(document.querySelectorAll(s)); };
 var state = { view:"dashboard", filter:"all", query:"", selectedId:null, cat:"primary", selected:{}, reading:false };
 
+function escapeHtml(s){
+  return String(s == null ? "" : s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#39;");
+}
+/* Strip active content from model-produced HTML (backend asks the model for
+   <b>/<br>/<i>/<ul>/<li> only). Anything else is dropped, not executed. */
+function stripUnsafeHtml(html){
+  return String(html || "")
+    .replace(/<\s*(script|iframe|object|embed|form|style|link|meta|base)[^>]*>[\s\S]*?<\s*\/\s*\1\s*>/gi, "")
+    .replace(/<\s*(script|iframe|object|embed|form|style|link|meta|base)[^>]*\/?>/gi, "")
+    .replace(/\s+on\w+\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/gi, "")
+    .replace(/(href|src)\s*=\s*("javascript:[^"]*"|'javascript:[^']*'|javascript:[^\s>]+)/gi, '$1="#"');
+}
 function initials(name){
   return name.split(" ").filter(Boolean).slice(0,2).map(function(w){return w[0];}).join("").toUpperCase();
 }
@@ -34,22 +87,22 @@ function starSvg(){
 function tagHtml(m){
   if(m.urgent) return '<span class="tag red">Urgent</span>';
   if(m.needsReply) return '<span class="tag amber">Needs reply</span>';
-  return '<span class="tag grey">'+m.tag+'</span>';
+  return '<span class="tag grey">'+escapeHtml(m.tag)+'</span>';
 }
 function mailRowHtml(m){
   return '<div class="mail-row'+(m.unread?" unread":"")+(state.selectedId===m.id?" selected":"")+'" data-open="'+m.id+'" role="button" tabindex="0">'
     + (m.unread?'<span class="unread-dot"></span>':'<span style="width:8px;flex:none"></span>')
     + '<span class="avatar" style="background:'+avatarColor(m.sender)+'">'+initials(m.sender)+'</span>'
-    + '<span class="mail-main"><span class="mail-line1"><span class="mail-sender">'+m.sender+'</span>'+tagHtml(m)+'<span class="mail-time num">'+m.time+'</span></span>'
-    + '<span class="mail-subject" style="display:block">'+m.subject+'</span>'
-    + '<span class="mail-snip" style="display:block">'+m.snippet+'</span></span>'
+    + '<span class="mail-main"><span class="mail-line1"><span class="mail-sender">'+escapeHtml(m.sender)+'</span>'+tagHtml(m)+'<span class="mail-time num">'+escapeHtml(m.time)+'</span></span>'
+    + '<span class="mail-subject" style="display:block">'+escapeHtml(m.subject)+'</span>'
+    + '<span class="mail-snip" style="display:block">'+escapeHtml(m.snippet)+'</span></span>'
     + '<button class="star-btn'+(m.starred?" on":"")+'" data-star="'+m.id+'" aria-label="Star this mail">'+starSvg()+'</button></div>';
 }
 function miniRowHtml(m){
-  return '<button class="mini-mail" data-open="'+m.id+'"><span class="avatar" style="background:'+avatarColor(m.sender)+';width:34px;height:34px;font-size:12px">'+initials(m.sender)+'</span>'
-    + '<span class="mini-main"><span class="mini-row"><span class="mini-sender">'+m.sender+'</span><span class="mini-time num">'+m.time+'</span></span>'
-    + '<span class="mini-subject" style="display:block">'+m.subject+'</span>'
-    + '<span class="mini-snip" style="display:block">'+m.snippet+'</span></span></button>';
+  return '<button class="mini-mail" data-open="'+m.id+'"><span class="avatar" style="background:'+avatarColor(m.sender)+';width:34px;height:34px;font-size:12px">'+escapeHtml(initials(m.sender))+'</span>'
+    + '<span class="mini-main"><span class="mini-row"><span class="mini-sender">'+escapeHtml(m.sender)+'</span><span class="mini-time num">'+escapeHtml(m.time)+'</span></span>'
+    + '<span class="mini-subject" style="display:block">'+escapeHtml(m.subject)+'</span>'
+    + '<span class="mini-snip" style="display:block">'+escapeHtml(m.snippet)+'</span></span></button>';
 }
 
 /* ================= Rendering ================= */
@@ -65,22 +118,27 @@ function renderStats(){
   $("#statTodaySub").innerHTML = "Since 12:00 AM today · <b>"+activeMails().filter(function(m){return m.today&&m.unread;}).length+" still unread</b>";
   var firstUrgent = activeMails().filter(function(m){return m.urgent;})[0];
   var firstReply = activeMails().filter(function(m){return m.needsReply;})[0];
-  $("#statUrgentSub").innerHTML = firstUrgent ? "Priority: <b>"+firstUrgent.subject+"</b>" : "Nothing marked urgent";
-  $("#statReplySub").innerHTML = firstReply ? "Waiting from: <b>"+firstReply.sender+"</b>" : "No one is waiting on you";
+  $("#statUrgentSub").innerHTML = firstUrgent ? "Priority: <b>"+escapeHtml(firstUrgent.subject)+"</b>" : "Nothing marked urgent";
+  $("#statReplySub").innerHTML = firstReply ? "Waiting from: <b>"+escapeHtml(firstReply.sender)+"</b>" : "No one is waiting on you";
   /* AI brief */
   $("#aiBriefText").innerHTML = "You received <b>"+c.today+" mails today</b>. <b>"+c.urgent+" are urgent</b> and <b>"+c.reply+" threads are waiting for your reply.</b>";
   var pts=[];
   activeMails().filter(function(m){return m.urgent;}).slice(0,3).forEach(function(m){
-    pts.push("<li><span class='dot'></span><span><b>"+m.sender+":</b> "+m.summary.split(".")[0]+".</span></li>");
+    pts.push("<li><span class='dot'></span><span><b>"+escapeHtml(m.sender)+":</b> "+escapeHtml((m.summary||"").split(".")[0])+".</span></li>");
   });
   var extra = activeMails().filter(function(m){return m.needsReply && !m.urgent;});
-  if(extra.length) pts.push("<li><span class='dot'></span><span>Also awaiting a reply: <b>"+extra.map(function(m){return m.sender;}).join(", ")+"</b>.</span></li>");
+  if(extra.length) pts.push("<li><span class='dot'></span><span>Also awaiting a reply: <b>"+extra.map(function(m){return escapeHtml(m.sender);}).join(", ")+"</b>.</span></li>");
   $("#aiBriefPoints").innerHTML = pts.join("");
 }
 function filteredMails(){
   var q=state.query.trim().toLowerCase();
-  return activeMails().filter(function(m){
-    if(q) return (m.sender+" "+m.subject+" "+m.snippet).toLowerCase().indexOf(q)>-1;
+  /* While searching, the pool is the server result set (SEARCH_RESULTS);
+     otherwise it is the loaded inbox. Stats always use MAILS. */
+  var pool = (q && SEARCH_RESULTS)
+    ? SEARCH_RESULTS.filter(function(m){ return !m.trashed && !m.archived; })
+    : activeMails();
+  return pool.filter(function(m){
+    if(q && (m.sender+" "+m.subject+" "+m.snippet).toLowerCase().indexOf(q)===-1) return false;
     if(state.filter==="unread" && !m.unread) return false;
     if(state.filter==="urgent" && !m.urgent) return false;
     if(state.filter==="reply" && !m.needsReply) return false;
@@ -108,10 +166,10 @@ function gmRowHtml(m){
     + '<button class="gm-check sm'+(sel?" on":"")+'" data-select="'+m.id+'" aria-label="Select conversation"><span class="box">'+ICO.check+'</span></button>'
     + '<button class="gm-star'+(m.starred?" on":"")+'" data-star="'+m.id+'" aria-label="Star this mail">'+(m.starred?ICO.starF:ICO.starO)+'</button>'
     + '<span class="gm-avatar" style="background:'+avatarColor(m.sender)+'">'+initials(m.sender)+'</span>'
-    + '<span class="gm-sender">'+m.sender+'</span>'
-    + '<span class="gm-mid"><span class="gm-subj">'+m.subject+'</span><span class="gm-snip"> — '+m.snippet+'</span></span>'
-    + '<span class="gm-labelchip">'+m.tag+'</span>'
-    + '<span class="gm-date num">'+m.time+'</span>'
+    + '<span class="gm-sender">'+escapeHtml(m.sender)+'</span>'
+    + '<span class="gm-mid"><span class="gm-subj">'+escapeHtml(m.subject)+'</span><span class="gm-snip"> — '+escapeHtml(m.snippet)+'</span></span>'
+    + '<span class="gm-labelchip">'+escapeHtml(m.tag)+'</span>'
+    + '<span class="gm-date num">'+escapeHtml(m.time)+'</span>'
     + '<span class="gm-actions">'
     + '<button class="gm-tbtn sm" data-act="archive" data-id="'+m.id+'" aria-label="Archive">'+ICO.archive+'</button>'
     + '<button class="gm-tbtn sm" data-act="trash" data-id="'+m.id+'" aria-label="Delete">'+ICO.trash+'</button>'
@@ -124,11 +182,12 @@ function selectedIds(){
 }
 function renderGmailChrome(){
   var list = filteredMails();
-  var total = activeMails().length;
-  var rangeTxt = list.length ? "1–"+list.length+" of "+total : "0 of "+total;
+  var rangeTxt = list.length ? "1–"+list.length+" of "+list.length : "0 of 0";
   var r1=$("#gmRange"), r2=$("#gmRange2");
   if(r1) r1.textContent = rangeTxt;
   if(r2) r2.textContent = rangeTxt;
+  var fc=$("#gmFootCount");
+  if(fc) fc.textContent = list.length ? list.length+" conversation"+(list.length>1?"s":"")+" in this view" : "No conversations in this view";
   /* Tab "new" badges = unread in that category */
   var soc = activeMails().filter(function(m){ return m.cat==="social" && m.unread; }).length;
   var pro = activeMails().filter(function(m){ return m.cat==="promotions" && m.unread; }).length;
@@ -136,7 +195,9 @@ function renderGmailChrome(){
   if(bs){ bs.hidden = soc===0; bs.textContent = soc+" new"; }
   if(bp){ bp.hidden = pro===0; bp.textContent = pro+" new"; }
   $$("#gmTabs .gm-tab").forEach(function(t){
-    t.classList.toggle("active", state.filter==="all" && !state.query && t.getAttribute("data-cat")===state.cat);
+    var on = state.filter==="all" && !state.query && t.getAttribute("data-cat")===state.cat;
+    t.classList.toggle("active", on);
+    t.setAttribute("aria-selected", on ? "true" : "false");
   });
   /* Master checkbox + toolbar swap */
   var visIds = list.map(function(m){ return m.id; });
@@ -187,20 +248,31 @@ function renderReader(){
   var pv=$("#gmPrev"), nx=$("#gmNext");
   if(pv) pv.disabled = idx<=0;
   if(nx) nx.disabled = idx<0 || idx>=list.length-1;
-  var bodyHtml = m.body.map(function(p){return "<p>"+p+"</p>";}).join("");
+  /* Body rendering: full-body paragraphs are escaped at load time and
+     already contain <br> separators (m._bodyIsHtml), so they are NOT
+     escaped again here; the snippet fallback is raw text and IS escaped.
+     HTML-only mail renders through the sanitiser into .gm-body-html. */
+  var bodyHtml;
+  if(m.bodyHtml){
+    bodyHtml = '<div class="gm-body-html">' + m.bodyHtml + '</div>';
+  } else if(m._bodyIsHtml){
+    bodyHtml = (m.body || []).map(function(p){return "<p>"+p+"</p>";}).join("");
+  } else {
+    bodyHtml = (m.body || [m.snippet || ""]).map(function(p){return "<p>"+escapeHtml(p)+"</p>";}).join("");
+  }
   box.innerHTML =
-    '<div class="gm-subject-row"><h2>'+m.subject+'</h2><span class="gm-labelchip">Inbox</span><span class="gm-labelchip">'+m.tag+'</span></div>'
+    '<div class="gm-subject-row"><h2>'+escapeHtml(m.subject)+'</h2><span class="gm-labelchip">Inbox</span><span class="gm-labelchip">'+escapeHtml(m.tag)+'</span></div>'
     + '<div class="gm-from"><span class="avatar" style="background:'+avatarColor(m.sender)+'">'+initials(m.sender)+'</span>'
-    + '<div class="gm-from-main"><div class="gm-from-line1"><span class="gm-from-name">'+m.sender+'</span><span class="gm-from-email">&lt;'+m.email+'&gt;</span>'
-    + '<span class="gm-from-right"><span class="gm-from-date num">'+m.time+'</span>'
+    + '<div class="gm-from-main"><div class="gm-from-line1"><span class="gm-from-name">'+escapeHtml(m.sender)+'</span><span class="gm-from-email">&lt;'+escapeHtml(m.email)+'&gt;</span>'
+    + '<span class="gm-from-right"><span class="gm-from-date num">'+escapeHtml(m.time)+'</span>'
     + '<button class="gm-star'+(m.starred?" on":"")+'" data-star="'+m.id+'" aria-label="Star this mail">'+(m.starred?ICO.starF:ICO.starO)+'</button>'
     + '<button class="gm-tbtn sm" id="gmHeadReply" aria-label="Reply">'+ICO.reply+'</button></span></div>'
     + '<div class="gm-from-to">to me</div></div></div>'
-    + '<div class="gm-ai"><h3><svg viewBox="0 0 24 24"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9Z"/></svg>AI summary</h3><p>'+m.summary+'</p></div>'
+    + '<div class="gm-ai"><h3><svg viewBox="0 0 24 24"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9Z"/></svg>AI summary</h3><p>'+escapeHtml(m.summary)+'</p></div>'
     + '<div class="gm-body">'+bodyHtml+'</div>'
     + '<div class="gm-reply-btns"><button class="gm-pill" id="gmReplyBtn">'+ICO.reply+'Reply</button>'
     + '<button class="gm-pill" id="gmForwardBtn">'+ICO.forward+'Forward</button></div>'
-    + '<div class="gm-replybox" id="gmReplyBox" hidden><textarea id="replyText" placeholder="Reply to '+m.sender+'…"></textarea>'
+    + '<div class="gm-replybox" id="gmReplyBox" hidden><textarea id="replyText" placeholder="Reply to '+escapeHtml(m.sender)+'…"></textarea>'
     + '<div class="gm-reply-actions"><button class="gm-send" id="replyMailto">Send</button>'
     + '<button class="gm-textbtn" id="replyDraft">Draft with AI</button>'
     + '<button class="gm-textbtn" id="replyCopy">Copy text</button></div></div>';
@@ -212,16 +284,31 @@ function renderReader(){
   var rb2=$("#gmHeadReply"); if(rb2) rb2.addEventListener("click",openReplyBox);
   var fw=$("#gmForwardBtn");
   if(fw) fw.addEventListener("click",function(){
-    openMailto("", "Fwd: "+m.subject, "\n\n---------- Forwarded message ----------\nFrom: "+m.sender+" <"+m.email+">\nSubject: "+m.subject+"\n\n"+m.body.join("\n\n"));
+    /* Forward opens the compose box prefilled (sent via the Gmail API
+       on submit), instead of a mailto: draft. */
+    var to=$("#cTo"), sub=$("#cSubject"), bod=$("#cBody");
+    if(to) to.value="";
+    if(sub) sub.value="Fwd: "+m.subject;
+    if(bod) bod.value="\n\n---------- Forwarded message ----------\nFrom: "+m.sender+" <"+m.email+">\nSubject: "+m.subject+"\n\n"+(m._bodyText || m.snippet || "");
+    openCompose();
   });
   var draftBtn=$("#replyDraft");
   if(draftBtn) draftBtn.addEventListener("click",function(){
-    $("#replyText").value = draftReply(m);
+    var rt=$("#replyText"); if(rt) rt.value = draftReply(m);
     toast("Draft added — edit it before sending");
   });
   var mailBtn=$("#replyMailto");
-  if(mailBtn) mailBtn.addEventListener("click",function(){
-    openMailto(m.email, "Re: "+m.subject, $("#replyText").value||"");
+  if(mailBtn) mailBtn.addEventListener("click",async function(){
+    var v=$("#replyText").value.trim();
+    if(!v){ toast("Write a reply first"); return; }
+    mailBtn.disabled=true; mailBtn.textContent="Sending…";
+    try {
+      var res = await apiFetch("/api/mails/" + m.id + "/reply", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ body: v }) });
+      var d = await res.json().catch(function(){ return {}; });
+      if(res.ok){ toast("Reply sent"); var rb=$("#gmReplyBox"); if(rb) rb.hidden=true; $("#replyText").value=""; }
+      else { toast(d.detail || "Couldn't send the reply"); }
+    } catch(e){ toast("Couldn't send the reply — check connection"); }
+    finally { mailBtn.disabled=false; mailBtn.textContent="Send"; }
   });
   var copyBtn=$("#replyCopy");
   if(copyBtn) copyBtn.addEventListener("click",function(){
@@ -316,43 +403,133 @@ function setCategory(c){
 }
 
 function syncStateToBackend(id, payload){
+  /* Returns a promise of true/false so callers only flip local state
+     when Gmail actually accepted the change. */
+  return apiFetch("/api/mails/" + id + "/state", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload)
+  }).then(function(res){
+    if(!res.ok){
+      return res.json().catch(function(){ return {}; }).then(function(d){
+        toast(d.detail || "Couldn't sync that change with Gmail");
+        return false;
+      });
+    }
+    return true;
+  }).catch(function(err){ console.log("State sync note:", err); toast("Couldn't reach the server to sync that change"); return false; });
+}
+
+async function bulkStateToBackend(ids, payload){
+  /* One Gmail batchModify for many mails; returns true only when the
+     server accepted the change, so callers never flip local state on a
+     failed sync. */
   try {
-    fetch("/api/mails/" + id + "/state", {
+    var res = await apiFetch("/api/mails/bulk-state", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload)
-    }).catch(function(err){ console.log("State sync note:", err); });
-  } catch(e){}
+      body: JSON.stringify(Object.assign({ ids: ids }, payload))
+    });
+    var d = await res.json().catch(function(){ return {}; });
+    if(!res.ok){ toast(d.detail || "Couldn't sync that change with Gmail"); return false; }
+    if(!d.synced_gmail){ toast("Gmail didn't accept that change — nothing was updated"); return false; }
+    return true;
+  } catch(e){
+    toast("Couldn't reach the server to sync that change");
+    return false;
+  }
 }
 
 /* Delegated clicks: open mail + star + Gmail row controls */
+async function loadFullBody(m){
+  /* The inbox list only carries the snippet. Fetch the real body once
+     per mail (GET /api/mails/{id}) and re-render the reader. Plain text
+     is preferred; HTML-only mail falls back to sanitised HTML. */
+  if(!m || m._fullLoading || m._fullLoaded) return;
+  m._fullLoading = true;
+  try {
+    var res = await apiFetch("/api/mails/" + m.id);
+    var d = await res.json();
+    if(res.ok && d.status === "success" && d.mail){
+      var txt = (d.mail.body_text || "").trim();
+      if(txt){
+        /* Keep the raw text for forwarding; the rendered paragraphs
+           below are the escaped version. */
+        m._bodyText = txt;
+        /* Escape first, then turn newlines into <br> — the <br> stays
+           live HTML while the mail text itself cannot inject markup. */
+        m.body = txt.split(/\n{2,}/).map(function(p){ return escapeHtml(p).replace(/\n/g, "<br>"); });
+        m.bodyHtml = "";
+        m._bodyIsHtml = true;
+      } else if(d.mail.body_html){
+        m.body = [];
+        m.bodyHtml = stripUnsafeHtml(d.mail.body_html);
+      }
+      if(d.mail.label_ids) m.labels = d.mail.label_ids.join(",");
+      m._fullLoaded = true;
+      if(state.reading && currentMail() === m) renderReader();
+    }
+  } catch(e){
+    console.log("Full body load note:", e);
+  } finally {
+    m._fullLoading = false;
+  }
+}
 function openMail(id){
   state.selectedId=id;
   state.reading=true;
+  var opened = null;
   MAILS.forEach(function(m){
     if(m.id===id){
       m.unread=false;
+      opened = m;
       syncStateToBackend(m.id, { is_unread: false });
     }
   });
+  if(!opened && SEARCH_RESULTS){
+    SEARCH_RESULTS.forEach(function(m){ if(m.id===id){ opened = m; m.unread=false; syncStateToBackend(m.id, { is_unread: false }); } });
+  }
   renderAll();
   showView("inbox");
+  if(opened) loadFullBody(opened);
 }
 function mailById(id){
   for(var i=0;i<MAILS.length;i++){ if(MAILS[i].id===id) return MAILS[i]; }
+  if(SEARCH_RESULTS){ for(var j=0;j<SEARCH_RESULTS.length;j++){ if(SEARCH_RESULTS[j].id===id) return SEARCH_RESULTS[j]; } }
   return null;
 }
 function rowAction(act, m){
   if(!m) return;
-  if(act==="archive"){ m.archived=true; if(state.selectedId===m.id) state.reading=false; toast("Conversation archived"); }
-  else if(act==="trash"){ m.trashed=true; if(state.selectedId===m.id) state.reading=false; toast("Conversation deleted"); syncStateToBackend(m.id, { is_trash: true }); }
-  else if(act==="spam"){ m.trashed=true; if(state.selectedId===m.id) state.reading=false; toast("Reported as spam"); }
+  if(act==="archive"){
+    syncStateToBackend(m.id, { is_archived: true }).then(function(ok){
+      if(!ok) return;
+      m.archived=true; if(state.selectedId===m.id) state.reading=false; delete state.selected[m.id]; renderAll();
+      toast("Conversation archived");
+    });
+    return;
+  }
+  else if(act==="trash"){
+    syncStateToBackend(m.id, { is_trash: true }).then(function(ok){
+      if(!ok) return;
+      m.trashed=true; if(state.selectedId===m.id) state.reading=false; delete state.selected[m.id]; renderAll();
+      toast("Conversation deleted");
+    });
+    return;
+  }
+  else if(act==="spam"){
+    syncStateToBackend(m.id, { is_spam: true }).then(function(ok){
+      if(!ok) return;
+      m.archived=true; if(state.selectedId===m.id) state.reading=false; delete state.selected[m.id]; renderAll();
+      toast("Reported as spam");
+    });
+    return;
+  }
   else if(act==="read"){
     m.unread = !m.unread;
     syncStateToBackend(m.id, { is_unread: m.unread });
     toast(m.unread ? "Marked as unread" : "Marked as read");
   }
-  else if(act==="snooze"){ toast("Snoozed until tomorrow, 8:00 AM"); }
+  else if(act==="snooze"){ toast("Snooze isn\u2019t available yet \u2014 this mail stays in your inbox"); }
   delete state.selected[m.id];
   renderAll();
 }
@@ -387,39 +564,73 @@ document.addEventListener("click",function(e){
     openMail(parseInt(open.getAttribute("data-open"),10));
   }
 });
-function markAll(){
-  var had=counts().unread>0;
+async function markAll(){
+  var unreadIds = activeMails().filter(function(m){ return m.unread; }).map(function(m){ return m.id; });
+  if(!unreadIds.length){ toast("Nothing unread"); return; }
+  var ok = await bulkStateToBackend(unreadIds, { is_unread: false });
+  if(!ok) return;
   activeMails().forEach(function(m){ m.unread=false; });
   renderAll();
-  toast(had ? "All mail marked as read" : "Nothing unread");
+  toast("All mail marked as read");
 }
 $("#markAllBtn").addEventListener("click",markAll);
 
-/* Search */
+/* Search: local filter as you type, plus a debounced server search
+   (GET /api/mails?q=) once the query is 2+ chars, so mail older than
+   the loaded page is findable too. */
+var searchTimer = null;
 $("#searchInput").addEventListener("input",function(e){
   state.query=e.target.value;
   state.reading=false;
   if(state.view!=="inbox" && state.query) showView("inbox");
+  var q = state.query.trim();
+  if(searchTimer) clearTimeout(searchTimer);
+  if(q.length >= 2){
+    searchTimer = setTimeout(function(){
+      apiFetch("/api/mails?q=" + encodeURIComponent(q)).then(function(res){ return res.json(); }).then(function(d){
+        if(d.status === "success" && Array.isArray(d.mails)){
+          SEARCH_RESULTS = d.mails;
+          SEARCH_RESULTS.forEach(function(m){ m.cat = m.cat || "primary"; m.archived = false; m.trashed = false; });
+          renderLists(); renderReader();
+        }
+      }).catch(function(){});
+    }, 350);
+  } else {
+    SEARCH_RESULTS = null;
+  }
   renderLists(); renderReader();
 });
 
 /* ================= Compose ================= */
-function openCompose(){ $("#scrim").classList.add("open"); $("#composeModal").classList.add("open"); }
+function openCompose(){ $("#scrim").classList.add("open"); $("#composeModal").classList.add("open"); var to=$("#cTo"); if(to) to.focus(); }
 function closeCompose(){ $("#scrim").classList.remove("open"); $("#composeModal").classList.remove("open"); }
 $("#composeBtn").addEventListener("click",openCompose);
 $("#composeClose").addEventListener("click",closeCompose);
-$("#scrim").addEventListener("click",closeCompose);
-function openMailto(to, subject, body){
-  var a=document.createElement("a");
-  a.href="mailto:"+encodeURIComponent(to)+"?subject="+encodeURIComponent(subject)+"&body="+encodeURIComponent(body);
-  document.body.appendChild(a); a.click(); a.remove();
-}
-$("#composeForm").addEventListener("submit",function(e){
+$("#scrim").addEventListener("click",function(){ closeCompose(); closeKeyModal(); });
+document.addEventListener("keydown",function(e){
+  if(e.key!=="Escape") return;
+  closeCompose(); closeKeyModal();
+  $("#sidebar").classList.remove("open"); $("#navScrim").classList.remove("open");
+  closeMenus();
+});
+$("#composeForm").addEventListener("submit",async function(e){
   e.preventDefault();
   var to=$("#cTo").value.trim(), sub=$("#cSubject").value.trim(), body=$("#cBody").value;
   if(!to){ toast("Add a recipient first"); return; }
-  openMailto(to, sub, body);
-  closeCompose();
+  if(!sub){ toast("Add a subject first"); return; }
+  if(!body.trim()){ toast("Write your message first"); return; }
+  try {
+    var res = await apiFetch("/api/mails/send", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ to: to, subject: sub, body: body }) });
+    var d = await res.json().catch(function(){ return {}; });
+    if(res.ok){
+      toast("Sent");
+      $("#cTo").value=""; $("#cSubject").value=""; $("#cBody").value="";
+      closeCompose();
+    } else {
+      /* Keep the draft open so nothing is lost; Copy draft still works. */
+      toast(d.detail || "Couldn't send the email");
+    }
+  } catch(err){ toast("Couldn't send the email — check connection"); }
 });
 $("#copyDraft").addEventListener("click",function(){
   var txt="To: "+$("#cTo").value+"\nSubject: "+$("#cSubject").value+"\n\n"+$("#cBody").value;
@@ -433,9 +644,9 @@ function addMsg(who,html){
   var d=document.createElement("div");
   d.className="msg "+who;
   if(who==="ai"){
-    d.innerHTML='<span class="who-ic"><img src="assets/logo-mark.png" alt="" onerror="this.src=\'assets/logo-mark.svg\'" /></span><div class="bubble">'+html+'</div>';
+    d.innerHTML='<span class="who-ic"><img src="assets/logo-mark.png" alt="" onerror="this.src=\'assets/logo-mark.svg\'" /></span><div class="bubble">'+stripUnsafeHtml(html)+'</div>';
   } else {
-    d.innerHTML='<div class="bubble">'+html+'</div>';
+    d.innerHTML='<div class="bubble">'+escapeHtml(html)+'</div>';
   }
   t.appendChild(d);
   d.scrollIntoView({behavior:"smooth",block:"end"});
@@ -444,7 +655,7 @@ function answerFor(q){
   var s=q.toLowerCase(), c=counts();
   if(s.indexOf("urgent")!==-1 || s.indexOf("deadline")!==-1){
     var u=MAILS.filter(function(m){return m.urgent;});
-    var items=u.map(function(m){return "<b>"+m.sender+"</b> — "+m.subject;}).join("<br>");
+    var items=u.map(function(m){return "<b>"+escapeHtml(m.sender)+"</b> — "+escapeHtml(m.subject);}).join("<br>");
     return u.length ? "You have <b>"+c.urgent+" urgent mails</b>:<br>"+items : "There are no urgent mails in the current inbox.";
   }
   if(s.indexOf("summar")!==-1 || s.indexOf("today")!==-1){
@@ -452,18 +663,18 @@ function answerFor(q){
   }
   if(s.indexOf("reply")!==-1 || s.indexOf("waiting")!==-1){
     var r=MAILS.filter(function(m){return m.needsReply;});
-    var names=r.map(function(m){return "<b>"+m.sender+"</b>";}).join(", ");
+    var names=r.map(function(m){return "<b>"+escapeHtml(m.sender)+"</b>";}).join(", ");
     return r.length ? "<b>"+c.reply+" threads are waiting for your reply</b>: "+names+"." : "No threads are waiting for your reply.";
   }
   if(s.indexOf("draft")!==-1){
     var top=MAILS.filter(function(m){return m.urgent;})[0];
-    return top ? "Here is a draft for the most urgent mail — <b>"+top.sender+"</b> (“"+top.subject+"”):<br><br><i>"+draftReply(top).replace(/\n/g,"<br>")+"</i>" : "There are no urgent mails to draft a reply for.";
+    return top ? "Here is a draft for the most urgent mail — <b>"+escapeHtml(top.sender)+"</b> (“"+escapeHtml(top.subject)+"”):<br><br><i>"+escapeHtml(draftReply(top)).replace(/\n/g,"<br>")+"</i>" : "There are no urgent mails to draft a reply for.";
   }
   return "Your inbox currently has <b>"+c.unread+" unread</b> and <b>"+c.urgent+" urgent</b> mails.";
 }
 async function handleChat(v){
   if(!v) return;
-  addMsg("me", v.replace(/</g,"&lt;"));
+  addMsg("me", v);
   
   // Create thinking bubble with live animation
   var thinkId = "think_" + Date.now();
@@ -471,12 +682,12 @@ async function handleChat(v){
   var d = document.createElement("div");
   d.className = "msg ai";
   d.id = thinkId;
-  d.innerHTML = '<span class="who-ic"><img src="assets/logo-mark.svg" alt="" /></span><div class="bubble"><i>Thinking with Gemini...</i></div>';
+  d.innerHTML = '<span class="who-ic"><img src="assets/logo-mark.png" alt="" onerror="this.src=\'assets/logo-mark.svg\'" /></span><div class="bubble"><i>Thinking\u2026</i></div>';
   t.appendChild(d);
   d.scrollIntoView({behavior:"smooth",block:"end"});
 
   try {
-    var res = await fetch("/api/chat-assistant", {
+    var res = await apiFetch("/api/chat-assistant", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ question: v })
@@ -553,25 +764,105 @@ $("#gmMaster2").addEventListener("click",function(){ state.selected={}; renderLi
 
 $("#gmFilterClear").addEventListener("click",function(){
   state.filter="all"; state.query=""; state.selected={};
+  SEARCH_RESULTS = null;
   var si=$("#searchInput"); if(si) si.value="";
   renderLists();
 });
+/* ================= Labels =================
+   The label button used to toast "Labels are shown on each
+   conversation" and do nothing. It now opens a real menu of the
+   user's Gmail labels; picking one applies (or removes, if already
+   on) it on every selected conversation via POST /api/mails/{id}/labels. */
+async function loadLabels(){
+  if(LABELS_CACHE) return LABELS_CACHE;
+  try {
+    var res = await apiFetch("/api/labels");
+    var d = await res.json();
+    LABELS_CACHE = (res.ok && d.status === "success") ? (d.labels || []) : [];
+  } catch(e){ LABELS_CACHE = []; }
+  return LABELS_CACHE;
+}
+function mailLabelIds(m){
+  return (m.labels || "").split(",").map(function(s){ return s.trim(); }).filter(Boolean);
+}
+async function openLabelMenu(anchorBtn, ids){
+  var menu = $("#gmLabelMenu");
+  if(!menu) return;
+  var labels = await loadLabels();
+  closeMenus();
+  if(!labels.length){
+    toast("No labels yet — create one in Gmail first");
+    return;
+  }
+  var targetIds = (ids && ids.length) ? ids : (currentMail() ? [currentMail().id] : []);
+  if(!targetIds.length){ toast("Open a conversation first"); return; }
+  menu.innerHTML = labels.map(function(l){
+    var on = targetIds.some(function(id){ var m = mailById(id); return m && mailLabelIds(m).indexOf(l.id) !== -1; });
+    return '<button data-label-id="' + escapeHtml(l.id) + '" data-label-on="' + (on ? "1" : "0") + '">' + (on ? "✓ " : "") + escapeHtml(l.name) + '</button>';
+  }).join("");
+  /* The menu lives in the list toolbar, which is hidden while reading —
+     so it is moved to <body> and positioned at the button instead. */
+  if(menu.parentNode !== document.body) document.body.appendChild(menu);
+  var r = anchorBtn.getBoundingClientRect();
+  menu.style.position = "fixed";
+  menu.style.top = (r.bottom + 4) + "px";
+  menu.style.left = Math.max(8, Math.min(r.left, window.innerWidth - 210)) + "px";
+  menu.style.right = "auto";
+  menu.classList.add("open");
+  menu.querySelectorAll("[data-label-id]").forEach(function(btn){
+    btn.addEventListener("click", function(){
+      var lid = btn.getAttribute("data-label-id");
+      var isOn = btn.getAttribute("data-label-on") === "1";
+      closeMenus();
+      applyLabelToMails(targetIds, lid, !isOn);
+    });
+  });
+}
+async function applyLabelToMails(ids, labelId, add){
+  var done = 0;
+  for(var i=0;i<ids.length;i++){
+    try {
+      var res = await apiFetch("/api/mails/" + ids[i] + "/labels", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(add ? { add: [labelId] } : { remove: [labelId] })
+      });
+      if(res.ok){
+        done++;
+        var m = mailById(ids[i]);
+        if(m){
+          var cur = mailLabelIds(m);
+          if(add && cur.indexOf(labelId)===-1) cur.push(labelId);
+          if(!add) cur = cur.filter(function(x){ return x !== labelId; });
+          m.labels = cur.join(",");
+        }
+      }
+    } catch(e){}
+  }
+  state.selected = {};
+  renderAll();
+  toast(done ? (add ? "Label applied" : "Label removed") : "Couldn't change the label");
+}
 $$("#gmBarSel [data-selact]").forEach(function(b){
   b.addEventListener("click",function(){
     var act=b.getAttribute("data-selact");
     var ids=selectedIds();
     if(!ids.length) return;
-    if(act==="snooze"){ toast("Snoozed "+ids.length+" conversation"+(ids.length>1?"s":"")+" until tomorrow, 8:00 AM"); state.selected={}; renderAll(); return; }
-    if(act==="label"){ toast("Labels are shown on each conversation"); return; }
-    ids.forEach(function(id){
-      var m=mailById(id); if(!m) return;
-      if(act==="archive") m.archived=true;
-      else if(act==="trash" || act==="spam") m.trashed=true;
-      else if(act==="read") m.unread=false;
+    if(act==="snooze"){ toast("Snooze isn\u2019t available yet \u2014 these mails stay in your inbox"); state.selected={}; renderAll(); return; }
+    if(act==="label"){ openLabelMenu(b, ids); return; }
+    var payload = act==="archive" ? { is_archived: true } : act==="trash" ? { is_trash: true } : act==="spam" ? { is_spam: true } : { is_unread: false };
+    bulkStateToBackend(ids, payload).then(function(ok){
+      if(!ok) return;
+      ids.forEach(function(id){
+        var m=mailById(id); if(!m) return;
+        if(act==="archive" || act==="spam") m.archived=true;
+        else if(act==="trash") m.trashed=true;
+        else if(act==="read") m.unread=false;
+      });
+      state.selected={};
+      renderAll();
+      toast(act==="archive" ? "Conversations archived" : act==="read" ? "Marked as read" : act==="spam" ? "Reported as spam" : "Conversations deleted");
     });
-    state.selected={};
-    renderAll();
-    toast(act==="archive" ? "Conversations archived" : act==="read" ? "Marked as read" : act==="spam" ? "Reported as spam" : "Conversations deleted");
   });
 });
 /* Reading toolbar */
@@ -580,12 +871,12 @@ function currentAction(act){ rowAction(act, currentMail()); }
 $("#gmReadArchive").addEventListener("click",function(){ currentAction("archive"); });
 $("#gmReadTrash").addEventListener("click",function(){ currentAction("trash"); });
 $("#gmReadSpam").addEventListener("click",function(){ currentAction("spam"); });
-$("#gmReadSnooze").addEventListener("click",function(){ toast("Snoozed until tomorrow, 8:00 AM"); state.reading=false; renderAll(); });
+$("#gmReadSnooze").addEventListener("click",function(){ toast("Snooze isn\u2019t available yet \u2014 this mail stays in your inbox"); state.reading=false; renderAll(); });
 $("#gmReadUnread").addEventListener("click",function(){
-  var m=currentMail(); if(m){ m.unread=true; } state.reading=false; renderAll();
+  var m=currentMail(); if(m){ m.unread=true; syncStateToBackend(m.id, { is_unread: true }); } state.reading=false; renderAll();
 });
 $("#gmReadLabel").addEventListener("click",function(){
-  var m=currentMail(); if(m) toast("Label: "+m.tag);
+  var m=currentMail(); if(m) openLabelMenu(this, [m.id]);
 });
 function stepMail(dir){
   var list=filteredMails();
@@ -605,7 +896,7 @@ async function initBackend(){
   }
 
   try {
-    var res = await fetch("/api/dashboard");
+    var res = await apiFetch("/api/dashboard");
     var data = await res.json();
     if(data.status === "success" || data.status === "warning"){
       var cfg = data.config || {};
@@ -622,20 +913,27 @@ async function initBackend(){
         var av = $("#userAvatar");
         if(av) av.textContent = initials(namePart);
         var gr = $("#greetingTitle");
-        if(gr) gr.textContent = "Good evening, " + (namePart.charAt(0).toUpperCase() + namePart.slice(1));
+        if(gr){
+          var hr = new Date().getHours();
+          var greet = hr < 12 ? "Good morning" : hr < 17 ? "Good afternoon" : "Good evening";
+          gr.textContent = greet + ", " + (namePart.charAt(0).toUpperCase() + namePart.slice(1));
+        }
       }
 
       var latest = data.data && data.data.latest;
       if(latest && latest.summary_markdown){
         var briefEl = $("#aiBriefText");
         if(briefEl){
-          briefEl.innerHTML = "<b>Today's Briefing:</b> " + latest.summary_markdown.slice(0, 320) + (latest.summary_markdown.length > 320 ? "…" : "");
+          var briefTxt = String(latest.summary_markdown).slice(0, 320) + (String(latest.summary_markdown).length > 320 ? "\u2026" : "");
+          briefEl.innerHTML = "<b>Today's Briefing:</b> " + escapeHtml(briefTxt);
         }
         if(latest.action_items){
-          var items = typeof latest.action_items === "string" ? JSON.parse(latest.action_items) : latest.action_items;
+          var items = null;
+          try { items = typeof latest.action_items === "string" ? JSON.parse(latest.action_items) : latest.action_items; }
+          catch(parseErr){ console.log("Action items parse note:", parseErr); }
           if(items && items.length){
             var pts = items.slice(0, 4).map(function(it){
-              return "<li><span class='dot'></span><span><b>" + (it.sender || "Action") + ":</b> " + it.task + " (" + (it.due || "ASAP") + ")</span></li>";
+              return "<li><span class='dot'></span><span><b>" + escapeHtml(it.sender || "Action") + ":</b> " + escapeHtml(it.task || "") + " (" + escapeHtml(it.due || "ASAP") + ")</span></li>";
             });
             $("#aiBriefPoints").innerHTML = pts.join("");
           }
@@ -648,7 +946,7 @@ async function initBackend(){
 
   // Load real emails from TiDB
   try {
-    var mres = await fetch("/api/mails");
+    var mres = await apiFetch("/api/mails");
     var mdata = await mres.json();
     if(mdata.status === "success" && Array.isArray(mdata.mails)){
       MAILS = mdata.mails;
@@ -669,9 +967,9 @@ var syncBtn = $("#syncLiveBtn");
 if(syncBtn){
   syncBtn.addEventListener("click", async function(){
     syncBtn.disabled = true;
-    toast("Syncing with Gmail & Gemini 3.5 Flash...");
+    toast("Syncing with Gmail...");
     try {
-      var res = await fetch("/api/sync-now", { method: "POST" });
+      var res = await apiFetch("/api/sync-now", { method: "POST" });
       var data = await res.json();
       if(res.ok){
         toast(data.message || ("Processed " + (data.processed_count || 0) + " emails successfully!"));
@@ -690,16 +988,19 @@ if(syncBtn){
 $("#gmRefresh").addEventListener("click", async function(){
   toast("Synchronizing inbox with Gmail...");
   try {
-    await fetch("/api/sync-inbox-state", { method: "POST" });
-  } catch(e){}
-  await initBackend();
-  toast("Inbox synchronized");
+    var syncRes = await apiFetch("/api/sync-inbox-state", { method: "POST" });
+    if(!syncRes.ok) throw new Error("sync failed");
+    await initBackend();
+    toast("Inbox synchronized");
+  } catch(e){
+    toast("Sync failed — showing the last loaded inbox");
+  }
 });
 
 /* ================= Config View Logic ================= */
 async function loadConfig(){
   try {
-    var res = await fetch("/api/config");
+    var res = await apiFetch("/api/config");
     var data = await res.json();
     if(data.status === "success"){
       var s = data.schedule || {};
@@ -754,7 +1055,7 @@ if(schForm){
       }
     };
     try {
-      var res = await fetch("/api/config", {
+      var res = await apiFetch("/api/config", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload)
@@ -782,7 +1083,7 @@ if(rngForm){
       }
     };
     try {
-      var res = await fetch("/api/config", {
+      var res = await apiFetch("/api/config", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload)
@@ -802,9 +1103,9 @@ var triggerBtn = $("#triggerSummaryNowBtn");
 if(triggerBtn){
   triggerBtn.addEventListener("click", async function(){
     triggerBtn.disabled = true;
-    toast("Executing consolidated summary pipeline across all batches...");
+    toast("Running summary...");
     try {
-      var res = await fetch("/api/summary/trigger", {
+      var res = await apiFetch("/api/summary/trigger", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ force_all: true })
@@ -829,19 +1130,19 @@ async function loadSummaryJobs(){
   var tb = $("#summaryJobsTableBody");
   if(!tb) return;
   try {
-    var res = await fetch("/api/summary/status");
+    var res = await apiFetch("/api/summary/status");
     var data = await res.json();
     if(data.status === "success" && data.jobs && data.jobs.length){
       var rows = data.jobs.map(function(j){
         var dt = j.created_at ? new Date(j.created_at).toLocaleString() : "Recently";
         var statusBadge = j.status === "COMPLETED" ? '<span class="badge-tag badge-active">COMPLETED</span>' :
                           j.status === "PROCESSING" ? '<span class="badge-tag badge-cooldown">PROCESSING</span>' :
-                          '<span class="badge-tag badge-disabled">' + j.status + '</span>';
+                          '<span class="badge-tag badge-disabled">' + escapeHtml(j.status) + '</span>';
         var urgentCount = j.urgent_count || 0;
         return "<tr>"
           + "<td><b>" + dt + "</b></td>"
           + "<td>" + statusBadge + "</td>"
-          + "<td>" + (j.date_range_info || "last_1_day") + "</td>"
+          + "<td>" + escapeHtml(j.date_range_info || "last_1_day") + "</td>"
           + "<td>" + (j.total_emails || 0) + "</td>"
           + "<td>" + (j.completed_batches || 0) + " / " + (j.total_batches || 0) + "</td>"
           + "<td>" + (urgentCount > 0 ? '<b style="color:var(--red)">' + urgentCount + ' urgent</b>' : '0') + "</td>"
@@ -853,6 +1154,7 @@ async function loadSummaryJobs(){
     }
   } catch(e){
     console.log("Error loading summary jobs:", e);
+    tb.innerHTML = '<tr><td colspan="6" style="text-align:center;color:var(--text-3);padding:20px">Couldn\u2019t load job history. Try Refresh.</td></tr>';
   }
 }
 
@@ -869,7 +1171,7 @@ async function loadApiKeys(){
   var tb = $("#apiKeysTableBody");
   if(!tb) return;
   try {
-    var res = await fetch("/api/keys");
+    var res = await apiFetch("/api/keys");
     var data = await res.json();
     if(data.status === "success" && data.keys && data.keys.length){
       var rows = data.keys.map(function(k){
@@ -881,9 +1183,9 @@ async function loadApiKeys(){
                           '<span class="badge-tag badge-active">Active</span>';
         return "<tr>"
           + "<td>" + provBadge + "</td>"
-          + "<td><b>" + k.label + "</b></td>"
-          + "<td><code>" + k.api_key_masked + "</code></td>"
-          + "<td>" + k.model_name + "</td>"
+          + "<td><b>" + escapeHtml(k.label) + "</b></td>"
+          + "<td><code>" + escapeHtml(k.api_key_masked) + "</code></td>"
+          + "<td>" + escapeHtml(k.model_name) + "</td>"
           + "<td>P" + k.priority + "</td>"
           + "<td>" + statusBadge + "</td>"
           + "<td>" + (k.success_requests || 0) + " / " + (k.failed_requests || 0) + "</td>"
@@ -902,6 +1204,7 @@ async function loadApiKeys(){
     }
   } catch(e){
     console.log("Error loading API keys:", e);
+    tb.innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--text-3);padding:20px">Couldn\u2019t load API keys. Check the connection and try again.</td></tr>';
   }
 }
 
@@ -951,7 +1254,7 @@ if(addKeyForm){
       rate_limit_rpm: 15
     };
     try {
-      var res = await fetch("/api/keys", {
+      var res = await apiFetch("/api/keys", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload)
@@ -979,7 +1282,7 @@ document.addEventListener("click", async function(e){
     testBtn.disabled = true;
     toast("Testing key connection...");
     try {
-      var res = await fetch("/api/keys/" + kid + "/test", { method: "POST" });
+      var res = await apiFetch("/api/keys/" + kid + "/test", { method: "POST" });
       var data = await res.json();
       if(res.ok){
         toast("Key verified successfully!");
@@ -1000,7 +1303,7 @@ document.addEventListener("click", async function(e){
     var kid = toggleBtn.getAttribute("data-togglekey");
     var isAct = toggleBtn.getAttribute("data-active") === "1";
     try {
-      var res = await fetch("/api/keys/" + kid, {
+      var res = await apiFetch("/api/keys/" + kid, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ is_active: !isAct })
@@ -1020,7 +1323,7 @@ document.addEventListener("click", async function(e){
     var kid = delBtn.getAttribute("data-delkey");
     if(confirm("Are you sure you want to delete this API key?")){
       try {
-        var res = await fetch("/api/keys/" + kid, { method: "DELETE" });
+        var res = await apiFetch("/api/keys/" + kid, { method: "DELETE" });
         if(res.ok){
           toast("Key deleted");
           loadApiKeys();
@@ -1032,6 +1335,25 @@ document.addEventListener("click", async function(e){
     return;
   }
 });
+
+/* ================= Admin token form ================= */
+var atForm = $("#adminTokenForm");
+if(atForm) atForm.addEventListener("submit", function(e){
+  e.preventDefault();
+  var v = $("#adminTokenInput").value.trim();
+  if(!v){ toast("Paste the admin token first"); return; }
+  setAdminToken(v);
+  $("#adminTokenInput").value = "";
+  refreshTokenStateLabel();
+  hideAuthNotice();
+  toast("Token saved for this tab — reloading data");
+  initBackend();
+});
+var atClear = $("#adminTokenClear");
+if(atClear) atClear.addEventListener("click", function(){ setAdminToken(""); refreshTokenStateLabel(); toast("Token cleared for this tab"); });
+var atGo = $("#authNoticeGo");
+if(atGo) atGo.addEventListener("click", function(){ showView("config"); var inp=$("#adminTokenInput"); if(inp) inp.focus(); });
+refreshTokenStateLabel();
 
 /* ================= Init ================= */
 applyLocalState();

@@ -6,10 +6,9 @@ from zoneinfo import ZoneInfo
 from fastapi import FastAPI, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
-from fastapi.middleware.cors import CORSMiddleware
 
 from app.database import init_db, get_system_config
-from app.routes.api import router as api_router
+from app.routes.api import router as api_router, cron_router as api_cron_router
 from app.routes.health import router as health_router
 from app.services.pipeline_service import execute_consolidated_pipeline
 
@@ -80,14 +79,14 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# NOTE: no CORS middleware on purpose. The UI is served from this same
+# app (same origin), so browsers do not need CORS to call /api. The old
+# `allow_origins=["*"]` + `allow_credentials=True` combo let ANY website
+# the user visited call this API from their browser — and the API has no
+# authentication (see NOTES-backend.md) — so any site could read mail,
+# delete API keys, or trigger summaries. If a separate frontend origin is
+# ever needed, re-add CORSMiddleware with that ONE explicit origin and
+# real auth first; never "*" again.
 
 # HTTP Cache-Control Optimization Middleware
 @app.middleware("http")
@@ -102,9 +101,10 @@ async def add_cache_headers(request: Request, call_next):
         response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
     return response
 
-# Include API Routes
+# Include API Routes (cron webhook is a separate router: CRON_SECRET auth only)
 app.include_router(health_router)
 app.include_router(api_router)
+app.include_router(api_cron_router)
 
 # Mount Static Directories for InboxCura Frontend
 app.mount("/css", StaticFiles(directory="static/css"), name="css")

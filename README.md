@@ -1,19 +1,20 @@
-# ⚡ InboxCura AI Workspace
+# ⚡ InboxCura — Manage Your Complete Gmail
 
-A premium, minimal email workspace & executive briefing engine featuring the **InboxCura** frontend (Dashboard, AI Assistant, and Gmail-style Inbox), backed by **TiDB Serverless** and **Google Gemini 3.5 Flash**.
+InboxCura is a **website for managing complete Gmail**: a Gmail-style inbox (Primary, Social, Promotions tabs, reading view, reply/forward, labels, search, filters, starring, archiving, deleting), a dashboard (Unread, Today, Urgent, Awaiting Reply), and an interactive **AI Assistant** — with an **executive AI briefing** (Gemini 3.5 Flash, Groq fallback) as one feature inside it, not the whole product.
 
-Built from the ground up to **strictly comply with Render's 512 MB Free Tier** without hitting Out-of-Memory (OOM) errors or paying for background cron workers.
+Backed by **FastAPI + TiDB Serverless**, built from the ground up to **strictly comply with Render's 512 MB Free Tier** without hitting Out-of-Memory (OOM) errors or paying for background cron workers.
 
 ---
 
 ## ✨ Features
 
-- **InboxCura Workspace:** Integrated Dashboard (Unread, Today, Urgent, Awaiting Reply), Gmail-style Inbox (Primary, Social, Promotions tabs, Reading view with AI summary and inline reply), and an interactive **AI Assistant**.
-- **Gemini 3.5 Flash Powered Assistant:** Ask questions directly about your emails or request draft replies with live responses from Gemini 3.5 Flash.
-- **Executive Daily Briefing:** Scans incoming emails from the last 24 hours, categorizes them, extracts urgent action items, and compiles an executive markdown summary.
-- **TiDB Serverless Deduplication:** External persistent MySQL-compatible storage (5GB free forever) stores processed message IDs so you never summarize or pay LLM tokens for the same email twice.
-- **Dual Delivery:** Reads right inside your web dashboard AND automatically sends a clean HTML/Markdown email digest to your inbox.
-- **Render Free Tier Optimized:** 
+- **Full Gmail workspace:** Gmail-style Inbox (Primary, Social, Promotions tabs from Gmail's own category labels, reading view with the **full email body**, inline reply and compose that **send via the Gmail API**), real labels (apply/remove Gmail labels), server search, bulk actions (mark-all-read, archive, spam, delete — all synced back to Gmail in one call), starring, archiving, deleting.
+- **Dashboard:** Unread, Mail received today, Urgent, Awaiting your reply — all computed from live Gmail state, with an AI brief for today.
+- **AI Assistant:** Ask questions directly about your emails or request draft replies, with automatic provider failover (Gemini 3.5 Flash → Groq `openai/gpt-oss-120b`).
+- **Executive Daily Briefing:** Scans incoming emails, categorizes them, extracts urgent action items, and compiles a markdown summary. Deduplication in TiDB means you never summarize or pay LLM tokens for the same email twice.
+- **Admin token auth:** every `/api` route (except the cron webhook) requires `Authorization: Bearer <ADMIN_TOKEN>`. Enter the token once in the Configuration view; it is kept only in that browser tab. If `ADMIN_TOKEN` is not set on the server, the API fails closed (503).
+- **Encrypted API keys at rest:** provider keys in TiDB are encrypted with Fernet (`API_KEY_ENCRYPTION_KEY`); legacy plaintext rows are re-encrypted on next write.
+- **Render Free Tier Optimized:**
   - Entire server footprint is only **~50–60 MB RAM** (leaves >85% free headroom on Render's 512 MB limit).
   - Handles Render cold starts (~45–50s wake-up) seamlessly via external cron pinging.
   - Zero background server costs: keeps Render sleeping 23.5 hours/day.
@@ -99,11 +100,14 @@ Open **[http://localhost:8000](http://localhost:8000)** in your browser to view 
    - **Instance Type:** `Free` (512 MB RAM)
 4. Under **Environment Variables**, add the keys from your `.env`:
    - `TIDB_HOST`, `TIDB_PORT`, `TIDB_USER`, `TIDB_PASSWORD`, `TIDB_DATABASE`
-   - `GEMINI_API_KEY`
+   - `GEMINI_API_KEY`, `GEMINI_MODEL` (default `gemini-3.5-flash`)
    - `GMAIL_CLIENT_ID`, `GMAIL_CLIENT_SECRET`, `GMAIL_REFRESH_TOKEN`
    - `MY_EMAIL`
    - `CRON_SECRET` *(generate any random 32-character string)*
+   - `ADMIN_TOKEN` *(generated for you if you deploy from `render.yaml` — copy it from the Render dashboard into the app's Configuration view)*
+   - `API_KEY_ENCRYPTION_KEY` *(generated for you if you deploy from `render.yaml`; encrypts provider keys stored in TiDB)*
 5. Click **Create Web Service**. Your service will deploy in ~2 minutes!
+6. Open the app, go to **Configuration → Admin Access**, and paste the `ADMIN_TOKEN` from the Render dashboard. Until you do, the dashboard shows a lock notice and no data loads.
 
 ---
 
@@ -126,6 +130,9 @@ Since Render Cron Jobs are a paid feature, we use **[cron-job.org](https://cron-
 
 ## 🔒 Security & Privacy
 
+- **Admin token on every API route:** all `/api` endpoints except `/api/cron-trigger` require `Authorization: Bearer <ADMIN_TOKEN>`. The token is generated in Render (`render.yaml` sets `generateValue: true`) and is never committed. If it is not set, the API fails closed with 503 instead of serving mail to the open internet. The cron webhook keeps its own `CRON_SECRET` with a timing-safe comparison.
+- **Encrypted provider keys:** API keys stored in TiDB are Fernet-encrypted (`API_KEY_ENCRYPTION_KEY`). Without that variable, keys are stored as plaintext with a startup warning.
+- **No wildcard CORS:** the UI is served same-origin, so no CORS middleware is configured at all.
 - **Direct Personal API:** Your emails are only processed through your own Google Cloud OAuth app and Google Gemini.
 - **TiDB TLS Encryption:** All database communication is enforced with `ssl_mode: VERIFY_IDENTITY`.
 - **Zero Third-Party Middlemen:** No external email services, tracking pixels, or intermediate servers.

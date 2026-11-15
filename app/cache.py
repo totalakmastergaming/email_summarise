@@ -6,9 +6,16 @@ class TTLCache:
     """
     Lightweight, thread-safe in-memory cache with Time-To-Live (TTL).
     Zero external dependencies, minimal memory footprint (<1MB).
+
+    Bounded: expired entries are swept on write, and the store is capped
+    at ``max_items`` (oldest first). Previously there was no cap and
+    expired entries were only removed when individually read, so the
+    assistant cache — keyed by arbitrary user questions — could grow
+    without limit on a 512MB Render instance.
     """
-    def __init__(self, default_ttl_seconds: int = 300):
+    def __init__(self, default_ttl_seconds: int = 300, max_items: int = 200):
         self.default_ttl = default_ttl_seconds
+        self.max_items = max_items
         self._store: dict[str, tuple[Any, float]] = {}
         self._lock = Lock()
 
@@ -24,8 +31,15 @@ class TTLCache:
 
     def set(self, key: str, value: Any, ttl: Optional[int] = None) -> None:
         with self._lock:
+            now = time.time()
+            # Sweep expired entries first, then drop oldest if still over cap.
+            expired = [k for k, (_, exp) in self._store.items() if exp <= now]
+            for k in expired:
+                del self._store[k]
+            while len(self._store) >= self.max_items:
+                self._store.pop(next(iter(self._store)))
             lifespan = ttl if ttl is not None else self.default_ttl
-            self._store[key] = (value, time.time() + lifespan)
+            self._store[key] = (value, now + lifespan)
 
     def delete(self, key: str) -> None:
         with self._lock:

@@ -1,8 +1,11 @@
 import json
 import logging
+import threading
+import time
 import uuid
-from datetime import datetime
+from datetime import date as date_type, datetime
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from app.config import settings
 from app.database import (
@@ -22,10 +25,34 @@ from app.services.llm_provider import (
     compute_dynamic_batches,
     execute_with_failover,
     ContextWindowExceededError,
-    LLMProviderError
+    LLMProviderError,
+    parse_json_response
 )
 
 logger = logging.getLogger(__name__)
+
+# Single-flight guard: the pipeline can be triggered from three places at
+# once (in-app scheduler, /api/cron-trigger, manual Sync/Summary buttons).
+# Without this, two concurrent runs fetch the same mail, both summarise it,
+# and the user gets TWO digest emails. A non-blocking lock makes the second
+# caller get a clean "already running" answer instead of a duplicate run.
+_pipeline_lock = threading.Lock()
+
+
+def _today_in_schedule_tz() -> date_type:
+    """'Today' in the user's configured schedule timezone.
+
+    Previously ``datetime.utcnow().date()`` — a 18:00 IST run is 12:30 UTC,
+    so late-evening IST runs could be archived under the wrong (UTC) date.
+    """
+    tz_name = "Asia/Kolkata"
+    try:
+        cfg = get_system_config("summary_schedule") or {}
+        tz_name = cfg.get("timezone") or tz_name
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = ZoneInfo("Asia/Kolkata")
+    return datetime.now(tz).date()
 
 # Primary spam & promotional noise filter keywords
 NOISE_KEYWORDS = [
@@ -52,9 +79,16 @@ def filter_spam_and_noise(emails: list[dict]) -> tuple[list[dict], list[dict]]:
         sender = (e.get("sender") or "").lower()
         snippet = (e.get("snippet") or "").lower()
 
-        # If sender or subject strongly indicates automated noise
+        # If sender or subject strongly indicates automated noise.
+        # NOISE_KEYWORDS (module constant) is the shared list — previously
+        # it was defined but never used while two inline lists duplicated
+        # parts of it. The inline promo list is kept for phrases the
+        # constant does not cover ("% off", "black friday", ...).
         is_automated = any(k in sender for k in ["no-reply", "noreply", "digest", "notification", "updates@"])
-        is_promo = any(k in subj or k in snippet for k in ["sale", "discount", "% off", "black friday", "newsletter", "weekly digest"])
+        is_promo = any(k in subj or k in snippet for k in NOISE_KEYWORDS) or any(
+            k in subj or k in snippet
+            for k in ["sale", "discount", "% off", "black friday", "newsletter", "weekly digest"]
+        )
 
         # Protect security alerts, verifications, or explicit user requests
         is_important = any(k in subj for k in ["urgent", "security alert", "action required", "deadline", "invoice", "payment", "interview", "invitation", "verify"])
@@ -102,12 +136,19 @@ Emails in this batch:
 """
     try:
         response_text, key_used = execute_with_failover(prompt, is_json=True)
-        parsed = json.loads(response_text)
+        parsed = parse_json_response(response_text)
         parsed["key_id_used"] = key_used.get("id")
         parsed["provider_used"] = key_used.get("provider")
         return parsed
     except ContextWindowExceededError:
-        # Context window exceeded: split batch in half and process sub-batches
+        # Context window exceeded: split batch in half and process sub-batches.
+        # Base case: a SINGLE email that still overflows cannot be split
+        # further — previously mid = 0 produced process_batch_slice([])
+        # and process_batch_slice([same email]) forever (infinite
+        # recursion -> RecursionError). Fail loudly instead.
+        if len(batch_emails) <= 1:
+            logger.error(f"Batch {batch_idx + 1}: a single email exceeds the context window; cannot split further.")
+            raise
         logger.warning(f"Batch {batch_idx + 1} exceeded context window. Splitting in half...")
         mid = len(batch_emails) // 2
         res1 = process_batch_slice(batch_emails[:mid], batch_idx, total_batches)
@@ -154,7 +195,7 @@ Return ONLY a valid JSON object matching the above schema.
 """
     response_text, key_used = execute_with_failover(prompt, is_json=True)
     try:
-        parsed = json.loads(response_text)
+        parsed = parse_json_response(response_text)
         return parsed
     except Exception as e:
         logger.error(f"Consolidation JSON parse error: {e}\nRaw: {response_text}")
@@ -180,6 +221,27 @@ def execute_consolidated_pipeline(range_config: Optional[dict] = None, force_all
     9. Deliver final report via Gmail and archive in TiDB.
     """
     job_uuid = str(uuid.uuid4())
+    # Single-flight: refuse a second concurrent run (scheduler + cron +
+    # manual trigger can overlap). The lock is released in `finally`.
+    if not _pipeline_lock.acquire(blocking=False):
+        logger.warning("Pipeline already running; refusing concurrent run.")
+        return {
+            "status": "busy",
+            "message": "A summary pipeline run is already in progress. Try again when it finishes.",
+            "job_uuid": job_uuid,
+        }
+    try:
+        return _execute_consolidated_pipeline_locked(job_uuid, range_config, force_all)
+    finally:
+        _pipeline_lock.release()
+
+
+def _execute_consolidated_pipeline_locked(job_uuid: str, range_config: Optional[dict] = None, force_all: bool = False) -> dict:
+    """
+    Fault-tolerant, all-or-nothing pipeline orchestration (see
+    execute_consolidated_pipeline docstring for the stage list).
+    Runs under the _pipeline_lock single-flight guard.
+    """
     logger.info(f"Starting consolidated summary pipeline (Job {job_uuid})...")
 
     # 1. Resolve date range configuration
@@ -197,13 +259,18 @@ def execute_consolidated_pipeline(range_config: Optional[dict] = None, force_all
             "job_uuid": job_uuid
         }
 
-    # 3. Synchronize states to TiDB
-    save_processed_emails(raw_emails)
-
-    # 4. Filter previously processed emails unless force_all is requested
+    # 3. Deduplicate BEFORE saving: which fetched ids are new to TiDB?
+    # Previously save_processed_emails() ran FIRST, so every fetched id
+    # already existed by the time get_unprocessed_message_ids() ran — the
+    # dedup always returned an empty set and every run re-summarised
+    # everything (the `if not target_emails: target_emails = raw_emails`
+    # fallback then masked it completely).
     candidate_ids = [e["id"] for e in raw_emails]
     unprocessed_ids = get_unprocessed_message_ids(candidate_ids) if not force_all else set(candidate_ids)
-    
+
+    # 4. Synchronize states to TiDB (now that dedup has been computed).
+    save_processed_emails(raw_emails)
+
     target_emails = [e for e in raw_emails if e["id"] in unprocessed_ids]
     if not target_emails:
         # All have been processed; if user explicitly clicked summary, summarize all matching the date range
@@ -265,6 +332,11 @@ def execute_consolidated_pipeline(range_config: Optional[dict] = None, force_all
             except Exception as e:
                 last_error = str(e)
                 logger.warning(f"Batch {idx + 1} attempt {attempt + 1} failed: {e}")
+                # Back off before retrying: previously the 3 attempts fired
+                # back-to-back, so a rate-limit/5xx was retried into the
+                # same throttled window and burned quota for nothing.
+                if attempt < max_batch_retries - 1:
+                    time.sleep((attempt + 1) * 2)
 
         if not batch_success:
             failed_batches += 1
@@ -307,7 +379,7 @@ def execute_consolidated_pipeline(range_config: Optional[dict] = None, force_all
     markdown_report = final_briefing.get("email_markdown_report", "")
 
     # 11. Save to daily_reports and update job status
-    today_date = datetime.utcnow().date()
+    today_date = _today_in_schedule_tz()
     save_daily_report(
         report_date=today_date,
         total_emails=total_emails_count,
@@ -325,7 +397,7 @@ def execute_consolidated_pipeline(range_config: Optional[dict] = None, force_all
     })
 
     # 12. Dispatch final email digest to user
-    subject = f"⚡ Consolidated Briefing ({total_emails_count} emails, {total_batches} batches) - {datetime.utcnow().strftime('%b %d, %Y')}"
+    subject = f"⚡ Consolidated Briefing ({total_emails_count} emails, {total_batches} batches) - {today_date.strftime('%b %d, %Y')}"
     send_daily_digest_email(subject, markdown_report)
 
     # 13. Invalidate caches so UI reflects new sync immediately

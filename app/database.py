@@ -1,6 +1,7 @@
 import json
 import logging
-from datetime import datetime, timedelta
+import threading
+from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager
 from queue import Queue, Empty
 from threading import Lock
@@ -8,18 +9,36 @@ from typing import Any, Optional
 import pymysql
 import pymysql.cursors
 from app.config import settings
+from app.crypto import decrypt_api_key, encrypt_api_key
 
 logger = logging.getLogger(__name__)
+
+
+def _utcnow_naive() -> datetime:
+    """Timezone-naive UTC now (TiDB DATETIME columns are naive).
+
+    ``datetime.utcnow()`` is deprecated; this is its exact equivalent.
+    """
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 class TiDBConnectionPool:
     """
     Lightweight, thread-safe connection pool for TiDB Cloud Serverless.
     Reuses open TLS/SSL connections to eliminate ~200-300ms handshake overhead per query.
+
+    The pool is BOUNDED: a semaphore caps live connections at
+    ``max_connections``. Previously ``get_connection()`` created a brand-new
+    connection whenever the pool queue was empty, so a burst of concurrent
+    FastAPI threadpool requests could open unlimited connections and blow
+    past TiDB Serverless limits. Now a caller waits up to 10s for a slot
+    and then fails loudly instead of opening connection #6, #7, ...
     """
     def __init__(self, max_connections: int = 5):
         self.max_connections = max_connections
         self._pool: Queue = Queue(maxsize=max_connections)
         self._lock = Lock()
+        # One slot per live connection (pooled + checked out).
+        self._slots = threading.Semaphore(max_connections)
 
     def _create_connection(self):
         return pymysql.connect(
@@ -46,9 +65,20 @@ class TiDBConnectionPool:
                     conn.close()
                 except Exception:
                     pass
+                # Slot stays held: this replacement reuses the dead conn's slot.
                 return self._create_connection()
         except Empty:
-            return self._create_connection()
+            if not self._slots.acquire(timeout=10):
+                raise TimeoutError(
+                    f"TiDB connection pool exhausted: {self.max_connections} live "
+                    "connections in use after 10s. Failing instead of opening "
+                    "an unbounded extra connection."
+                )
+            try:
+                return self._create_connection()
+            except Exception:
+                self._slots.release()
+                raise
 
     def release_connection(self, conn):
         if not conn:
@@ -56,11 +86,12 @@ class TiDBConnectionPool:
         try:
             self._pool.put_nowait(conn)
         except Exception:
-            # Pool full, close socket safely
+            # Pool full, close socket safely and free its slot.
             try:
                 conn.close()
             except Exception:
                 pass
+            self._slots.release()
 
 # Reusable connection pool singleton
 db_pool = TiDBConnectionPool(max_connections=5)
@@ -107,6 +138,8 @@ def init_db():
                     is_unread BOOLEAN DEFAULT TRUE,
                     is_starred BOOLEAN DEFAULT FALSE,
                     labels VARCHAR(500) NULL,
+                    is_archived BOOLEAN DEFAULT FALSE,
+                    is_trashed BOOLEAN DEFAULT FALSE,
                     received_at DATETIME NULL,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     INDEX idx_msg_id (message_id)
@@ -122,6 +155,10 @@ def init_db():
                 cur.execute("ALTER TABLE processed_emails ADD COLUMN is_starred BOOLEAN DEFAULT FALSE")
             if "labels" not in existing_cols:
                 cur.execute("ALTER TABLE processed_emails ADD COLUMN labels VARCHAR(500) NULL")
+            if "is_archived" not in existing_cols:
+                cur.execute("ALTER TABLE processed_emails ADD COLUMN is_archived BOOLEAN DEFAULT FALSE")
+            if "is_trashed" not in existing_cols:
+                cur.execute("ALTER TABLE processed_emails ADD COLUMN is_trashed BOOLEAN DEFAULT FALSE")
 
             # 2. Daily executive digest reports archive
             cur.execute("""
@@ -222,13 +259,14 @@ def init_db():
             """, (default_schedule, default_range))
 
             # Seed primary Gemini key from .env if api_keys is empty
+            # (encrypted at rest when API_KEY_ENCRYPTION_KEY is configured).
             cur.execute("SELECT COUNT(*) AS count FROM api_keys")
             cnt_row = cur.fetchone()
             if cnt_row and cnt_row.get("count", 0) == 0 and settings.GEMINI_API_KEY:
                 cur.execute("""
                     INSERT INTO api_keys (provider, label, api_key, model_name, priority, is_active, rate_limit_rpm)
                     VALUES (%s, %s, %s, %s, 1, TRUE, 15)
-                """, ("gemini", "Primary Gemini Flash", settings.GEMINI_API_KEY, settings.GEMINI_MODEL))
+                """, ("gemini", "Primary Gemini Flash", encrypt_api_key(settings.GEMINI_API_KEY), settings.GEMINI_MODEL))
                 logger.info("Seeded primary Gemini API key into api_keys table.")
 
         logger.info("TiDB schema verified and tables initialized successfully.")
@@ -289,8 +327,8 @@ def save_processed_emails(emails_data: list[dict]):
             ))
         cur.executemany(sql, values)
 
-def update_processed_email_state(message_id_or_pk: str, is_unread: Optional[bool] = None, is_starred: Optional[bool] = None) -> bool:
-    """Update local email read/starred status in TiDB."""
+def update_processed_email_state(message_id_or_pk: str, is_unread: Optional[bool] = None, is_starred: Optional[bool] = None, is_archived: Optional[bool] = None, is_trashed: Optional[bool] = None) -> bool:
+    """Update local email read/starred/archive/trash status in TiDB."""
     updates = []
     params = []
     if is_unread is not None:
@@ -299,6 +337,12 @@ def update_processed_email_state(message_id_or_pk: str, is_unread: Optional[bool
     if is_starred is not None:
         updates.append("is_starred = %s")
         params.append(bool(is_starred))
+    if is_archived is not None:
+        updates.append("is_archived = %s")
+        params.append(bool(is_archived))
+    if is_trashed is not None:
+        updates.append("is_trashed = %s")
+        params.append(bool(is_trashed))
     if not updates:
         return False
 
@@ -366,7 +410,7 @@ def get_api_keys(include_secret: bool = False) -> list[dict]:
         rows = cur.fetchall()
 
     result = []
-    now = datetime.utcnow()
+    now = _utcnow_naive()
     for r in rows:
         key_raw = r.get("api_key", "")
         cooldown = r.get("cooldown_until")
@@ -390,14 +434,34 @@ def get_api_keys(include_secret: bool = False) -> list[dict]:
             "api_key_masked": mask_api_key(key_raw)
         }
         if include_secret:
-            item["api_key"] = key_raw
+            item["api_key"] = decrypt_api_key(key_raw)
         result.append(item)
     return result
 
-def get_active_api_keys(provider: Optional[str] = None) -> list[dict]:
-    """Retrieve all active keys not currently in cooldown, sorted by priority."""
+
+def get_api_key_by_id(key_id: int) -> Optional[dict]:
+    """Retrieve one API key row with the secret decrypted (internal use only).
+
+    Callers must never return ``api_key`` to the frontend. Use this instead
+    of a raw ``SELECT * FROM api_keys`` so encrypted rows actually work.
+    """
     with get_db_cursor() as cur:
-        now = datetime.utcnow()
+        cur.execute("SELECT * FROM api_keys WHERE id = %s", (key_id,))
+        row = cur.fetchone()
+    if not row:
+        return None
+    row = dict(row)
+    row["api_key"] = decrypt_api_key(row.get("api_key", ""))
+    return row
+
+def get_active_api_keys(provider: Optional[str] = None) -> list[dict]:
+    """Retrieve all active keys not currently in cooldown, sorted by priority.
+
+    Returned rows carry the DECRYPTED ``api_key`` — this is internal-only
+    (LLM callers); never serialize these rows to an API response.
+    """
+    with get_db_cursor() as cur:
+        now = _utcnow_naive()
         if provider:
             cur.execute("""
                 SELECT * FROM api_keys 
@@ -412,15 +476,18 @@ def get_active_api_keys(provider: Optional[str] = None) -> list[dict]:
                   AND (cooldown_until IS NULL OR cooldown_until <= %s)
                 ORDER BY priority ASC, success_requests ASC, id ASC
             """, (now,))
-        return cur.fetchall()
+        rows = cur.fetchall()
+    for r in rows:
+        r["api_key"] = decrypt_api_key(r.get("api_key", ""))
+    return rows
 
 def add_api_key(provider: str, label: str, api_key: str, model_name: str, priority: int = 1, rate_limit_rpm: int = 15) -> int:
-    """Add a new AI provider API key."""
+    """Add a new AI provider API key (encrypted at rest when configured)."""
     with get_db_cursor(commit=True) as cur:
         cur.execute("""
             INSERT INTO api_keys (provider, label, api_key, model_name, priority, is_active, rate_limit_rpm)
             VALUES (%s, %s, %s, %s, %s, TRUE, %s)
-        """, (provider.strip().lower(), label.strip(), api_key.strip(), model_name.strip(), priority, rate_limit_rpm))
+        """, (provider.strip().lower(), label.strip(), encrypt_api_key(api_key.strip()), model_name.strip(), priority, rate_limit_rpm))
         return cur.lastrowid
 
 def update_api_key(key_id: int, updates: dict) -> bool:
@@ -431,7 +498,8 @@ def update_api_key(key_id: int, updates: dict) -> bool:
     for k, v in updates.items():
         if k in allowed:
             clauses.append(f"{k} = %s")
-            params.append(v)
+            # Re-encrypt a rotated key value instead of storing it raw.
+            params.append(encrypt_api_key(str(v).strip()) if k == "api_key" else v)
     if not clauses:
         return False
     params.append(key_id)
@@ -468,7 +536,7 @@ def record_api_key_usage(key_id: int, success: bool, error_msg: Optional[str] = 
 
 def set_api_key_cooldown(key_id: int, seconds: int = 60, error_msg: Optional[str] = None):
     """Place an API key on temporary cooldown after rate limits or 429 quota exhaustion."""
-    cooldown_time = datetime.utcnow() + timedelta(seconds=seconds)
+    cooldown_time = _utcnow_naive() + timedelta(seconds=seconds)
     with get_db_cursor(commit=True) as cur:
         cur.execute("""
             UPDATE api_keys SET
