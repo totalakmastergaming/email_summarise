@@ -511,3 +511,43 @@
   .badge-disabled{background:var(--red-soft);color:var(--red)}
 
   .code-box{background:var(--surface-2);border:1px solid var(--border);border-radius:8px;padding:12px 14px;font-family:monospace;font-size:12.5px;color:var(--text-2);word-break:break-all}
+
+  /* ---------- Thread reader ---------- */
+  .msg-count{
+    display:inline-flex;align-items:center;justify-content:center;min-width:20px;height:18px;
+    padding:0 5px;border-radius:9px;background:var(--gm-chip);color:var(--gm-text2);
+    font-size:11px;font-weight:700;flex:none;
+  }
+  .thread-msg{border:1px solid var(--gm-border);border-radius:10px;margin:12px 24px 0 78px;overflow:hidden}
+  .thread-msg.latest{border-color:var(--border-strong)}
+  .thread-msg-head{display:flex;align-items:center;gap:10px;padding:10px 14px}
+  .thread-msg-head .avatar{width:34px;height:34px;font-size:13px}
+  .thread-msg-who{flex:1;min-width:0;display:flex;flex-direction:column}
+  .thread-msg-name{font-size:14px;font-weight:700;color:var(--gm-text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .thread-msg-email{font-size:12.5px;color:var(--gm-text2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .thread-msg-meta{display:flex;align-items:center;gap:6px;flex:none}
+  .thread-msg-date{font-size:12.5px;color:var(--gm-text2);white-space:nowrap}
+  .msg-unread{font-size:11px;font-weight:700;color:var(--red);background:var(--red-soft);border-radius:99px;padding:2px 8px;flex:none}
+  .thread-msg-snip{padding:0 14px 12px 58px;font-size:13.5px;color:var(--gm-text2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .thread-msg .gm-body{padding:12px 14px 4px 14px}
+  .thread-msg .gm-error{margin:12px 14px}
+  .gm-replyall{display:flex;align-items:center;gap:8px;font-size:13.5px;font-weight:600;color:var(--gm-text2);padding:10px 12px 0}
+  .gm-replyall input{accent-color:var(--gm-blue)}
+  /* Inline error box (inbox list + reader): visible failure state with retry */
+  .gm-error{
+    display:flex;align-items:center;gap:12px;justify-content:space-between;flex-wrap:wrap;
+    border:1px solid var(--red);background:var(--red-soft);color:var(--text);
+    border-radius:8px;padding:12px 14px;font-size:13.5px;font-weight:600;margin:12px 16px;
+  }
+  #reader .gm-error{margin:16px 24px 26px 78px}
+  .gm-retry{
+    border:1px solid var(--red);color:var(--red);background:var(--surface);
+    border-radius:6px;padding:6px 12px;font-size:13px;font-weight:700;flex:none;min-height:32px;
+  }
+  .gm-retry:hover{background:var(--red-soft)}
+  @media (max-width:720px){
+    .thread-msg{margin:12px 16px 0 16px}
+    .thread-msg-snip{padding:0 14px 12px 14px}
+    #reader .gm-error{margin:16px 16px 20px 16px}
+    .thread-msg-email{display:none}
+  }

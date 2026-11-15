@@ -16,6 +16,9 @@ from app.database import (
     get_db_cursor,
     update_processed_email_state,
     get_email_by_id_or_msg_id,
+    get_thread_messages,
+    list_threads,
+    get_sync_checkpoint,
     get_system_config,
     set_system_config,
     get_api_keys,
@@ -27,13 +30,13 @@ from app.database import (
     get_latest_summary_jobs,
     get_job_batches
 )
+from app.services.history_sync import run_incremental_sync, maybe_trigger_background_sync
 from app.cache import dashboard_cache, assistant_cache, invalidate_inbox_caches
 from app.services.gmail_service import (
     fetch_recent_emails,
     get_email_full,
     update_gmail_message_state,
     batch_update_message_states,
-    sync_inbox_labels_from_gmail,
     list_user_labels,
     modify_message_labels,
     send_email,
@@ -115,6 +118,11 @@ class LabelRequest(BaseModel):
 
 class ReplyRequest(BaseModel):
     body: str
+
+
+class ThreadReplyRequest(BaseModel):
+    body: str
+    reply_all: bool = False
 
 
 class SendRequest(BaseModel):
@@ -282,91 +290,115 @@ def get_dashboard_data():
             }
         }
 
+def _mail_obj_from_row(r: dict) -> dict:
+    """One processed_emails row -> the mail object the UI consumes.
+
+    Shared by the paginated inbox list and the thread view so both
+    agree on every field. Extra keys the list did not used to carry
+    (date, received_at, archived, trashed) are additive — the UI
+    ignores unknown fields.
+    """
+    received_at = r.get("received_at")
+    time_str = _display_time(received_at, r.get("created_at"))
+    sender_str = r.get("sender", "Unknown")
+    email_part = sender_str
+    name_part = sender_str
+    if "<" in sender_str and ">" in sender_str:
+        name_part = sender_str.split("<")[0].strip()
+        email_part = sender_str.split("<")[1].split(">")[0].strip()
+
+    snippet = r.get("snippet", "")
+    subject_text = r.get("subject", "(No Subject)")
+    subject_lower = subject_text.lower()
+    is_urgent = any(w in subject_lower for w in ["urgent", "action required", "deadline", "immediate", "alert", "security alert"])
+
+    # Use live values stored in database
+    is_unr = bool(r.get("is_unread", True))
+    is_sta = bool(r.get("is_starred", False))
+    # Real Gmail category (was hardcoded "primary" for every mail).
+    category = _category_from_labels(r.get("labels", ""))
+
+    received_iso = None
+    if received_at:
+        try:
+            received_iso = received_at.isoformat() if hasattr(received_at, "isoformat") else str(received_at)
+        except Exception:
+            received_iso = None
+
+    return {
+        "id": 1000 + r["id"],
+        "message_id": r.get("message_id"),
+        "thread_id": r.get("thread_id") or r.get("message_id"),
+        "sender": name_part or email_part,
+        "email": email_part,
+        "subject": subject_text,
+        "snippet": snippet,
+        "body": [snippet] if snippet else ["No further content preview."],
+        "summary": snippet[:140] if snippet else "",
+        "time": time_str,
+        "date": received_iso,
+        "received_at": received_iso,
+        "today": _is_today(received_at),
+        "unread": is_unr,
+        "urgent": is_urgent,
+        "starred": is_sta,
+        "archived": bool(r.get("is_archived", False)),
+        "trashed": bool(r.get("is_trashed", False)),
+        "needsReply": _needs_reply(is_unr, category, sender_str, subject_text),
+        "tag": "Alert" if is_urgent else "Inbound",
+        "cat": category,
+        "labels": r.get("labels", "")
+    }
+
+
 @router.get("/mails")
-def get_inbox_mails(q: Optional[str] = None):
+@router.get("/emails")
+def get_inbox_mails(q: Optional[str] = None, folder: str = "inbox",
+                    cat: Optional[str] = None, limit: int = 30,
+                    cursor: Optional[str] = None):
     """
-    Returns processed emails formatted for the InboxCura UI.
-    Cached in RAM with 60s TTL for instant page loads.
-    `q` searches subject / sender / snippet server-side (the UI search
-    used to filter only the 60 already-loaded rows, so anything older
-    than the latest page was unfindable). Search results bypass the
-    cache so they are always fresh.
-    """
-    cached = None if q else dashboard_cache.get("mails")
-    if cached is not None:
-        cached_copy = dict(cached)
-        cached_copy["cached"] = True
-        return cached_copy
+    Threaded, keyset-paginated inbox list, served from the TiDB mirror.
 
+    WHY THE MIRROR, NOT LIVE GMAIL: listing a page live from Gmail
+    would cost 30+ Gmail calls per page (one list + one metadata fetch
+    per message) and still could not group messages into threads
+    correctly, because Gmail's list returns flat messages. The History
+    sync (see app/services/history_sync.py) keeps the mirror current,
+    so the list reads one cheap SQL query instead. The cursor is an
+    opaque, validated keyset token (last seen row id + the query it
+    belongs to) — the same pattern as Gmail's own pageToken, with NO
+    SQL OFFSET anywhere. A background incremental sync is kicked off
+    (throttled, never blocking) so browsing keeps the mirror fresh.
+    """
+    # Fire-and-forget freshness: throttled to once per 120s, never
+    # blocks this response.
+    maybe_trigger_background_sync()
     try:
-        with get_db_cursor() as cur:
-            # Archived / trashed mail is no longer in the inbox.
-            if q and q.strip():
-                pattern = f"%{q.strip()}%"
-                cur.execute(
-                    "SELECT * FROM processed_emails "
-                    "WHERE is_archived = FALSE AND is_trashed = FALSE "
-                    "AND (subject LIKE %s OR sender LIKE %s OR snippet LIKE %s) "
-                    "ORDER BY id DESC LIMIT 60",
-                    (pattern, pattern, pattern),
-                )
-            else:
-                cur.execute(
-                    "SELECT * FROM processed_emails "
-                    "WHERE is_archived = FALSE AND is_trashed = FALSE "
-                    "ORDER BY id DESC LIMIT 60"
-                )
-            rows = cur.fetchall()
-
-        mails = []
-        for r in rows:
-            received_at = r.get("received_at")
-            time_str = _display_time(received_at, r.get("created_at"))
-            sender_str = r.get("sender", "Unknown")
-            email_part = sender_str
-            name_part = sender_str
-            if "<" in sender_str and ">" in sender_str:
-                name_part = sender_str.split("<")[0].strip()
-                email_part = sender_str.split("<")[1].split(">")[0].strip()
-
-            snippet = r.get("snippet", "")
-            subject_text = r.get("subject", "(No Subject)")
-            subject_lower = subject_text.lower()
-            is_urgent = any(w in subject_lower for w in ["urgent", "action required", "deadline", "immediate", "alert", "security alert"])
-
-            # Use live values stored in database
-            is_unr = bool(r.get("is_unread", True))
-            is_sta = bool(r.get("is_starred", False))
-            # Real Gmail category (was hardcoded "primary" for every mail).
-            category = _category_from_labels(r.get("labels", ""))
-
-            mails.append({
-                "id": 1000 + r["id"],
-                "message_id": r.get("message_id"),
-                "sender": name_part or email_part,
-                "email": email_part,
-                "subject": subject_text,
-                "snippet": snippet,
-                "body": [snippet] if snippet else ["No further content preview."],
-                "summary": snippet[:140] if snippet else "",
-                "time": time_str,
-                "today": _is_today(received_at),
-                "unread": is_unr,
-                "urgent": is_urgent,
-                "starred": is_sta,
-                "needsReply": _needs_reply(is_unr, category, sender_str, subject_text),
-                "tag": "Alert" if is_urgent else "Inbound",
-                "cat": category,
-                "labels": r.get("labels", "")
-            })
-
-        result = {"status": "success", "mails": mails, "cached": False}
-        if not q:
-            dashboard_cache.set("mails", result, ttl=60)
-        return result
+        rows, next_cursor, has_more = list_threads(
+            folder=folder, cat=cat, q=q, limit=limit, cursor=cursor
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except Exception as e:
         logger.error(f"Error retrieving mails for InboxCura: {e}")
-        return {"status": "error", "mails": []}
+        return {"status": "error", "mails": [], "next_cursor": None, "has_more": False,
+                "folder": folder, "limit": limit}
+
+    mails = []
+    for r in rows:
+        mail = _mail_obj_from_row(r)
+        mail["message_count"] = int(r.get("message_count") or 1)
+        mail["unread_count"] = int(r.get("unread_count") or 0)
+        mails.append(mail)
+
+    return {
+        "status": "success",
+        "mails": mails,
+        "next_cursor": next_cursor,
+        "has_more": has_more,
+        "folder": folder,
+        "limit": max(1, min(100, int(limit or 30))),
+    }
 
 @router.get("/labels")
 def list_labels():
@@ -470,6 +502,148 @@ def get_mail_detail(mail_id: str):
             "archived": bool(email_record.get("is_archived", False)),
             "trashed": bool(email_record.get("is_trashed", False)),
         },
+    }
+
+
+# ================= Thread Endpoints (Phase 1) =================
+
+@router.get("/threads/{thread_id}")
+def get_thread(thread_id: str):
+    """One thread, messages chronological.
+
+    Bodies are NOT stored in TiDB, so only the LATEST message gets its
+    full body fetched from Gmail on demand; every other message carries
+    has_body=false. A Gmail failure for that one body fetch degrades
+    the response (empty body + body_error) instead of failing the
+    whole thread.
+    """
+    rows = get_thread_messages(thread_id)
+    if not rows:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Thread not found.")
+
+    canonical_id = rows[-1].get("thread_id") or rows[-1].get("message_id")
+    messages = []
+    body_error = None
+    for idx, r in enumerate(rows):
+        m = _mail_obj_from_row(r)
+        m["has_body"] = False
+        if idx == len(rows) - 1:
+            try:
+                full = get_email_full(r["message_id"])
+                m["body_text"] = full.get("body_text", "")
+                m["body_html"] = full.get("body_html", "")
+                m["has_body"] = True
+            except Exception as e:
+                logger.error(f"Error fetching full body for latest message in thread {thread_id}: {e}")
+                m["body_text"] = ""
+                m["body_html"] = ""
+                body_error = str(e)
+        messages.append(m)
+
+    result: dict = {
+        "status": "success",
+        "thread": {"thread_id": canonical_id, "messages": messages},
+    }
+    if body_error:
+        result["body_error"] = body_error
+    return result
+
+
+@router.post("/threads/{thread_id}/state")
+def update_thread_state(thread_id: str, req: MailStateRequest):
+    """Apply a state change to a whole thread, with Gmail-correct
+    semantics (Gmail stars are per-message; read/archive/trash/spam
+    apply to every message in the thread).
+
+    - mark read/unread, archive, trash, spam: ALL messages, ONE
+      batchModify call.
+    - star: LATEST message only.
+    - unstar: ALL starred messages in the thread.
+    Local rows are updated only for the parts Gmail accepted.
+    """
+    rows = get_thread_messages(thread_id)
+    if not rows:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Thread not found.")
+    if all(v is None for v in (req.is_unread, req.is_starred, req.is_trash, req.is_archived, req.is_spam)):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No state change provided.")
+
+    all_ids = [r["message_id"] for r in rows]
+    latest_id = rows[-1]["message_id"]
+    synced = True
+    updated_ids: set = set()
+
+    # Part 1: thread-wide flags, one batchModify for all messages.
+    if any(v is not None for v in (req.is_unread, req.is_trash, req.is_archived, req.is_spam)):
+        ok = batch_update_message_states(
+            all_ids,
+            is_unread=req.is_unread,
+            is_trash=req.is_trash,
+            is_archived=req.is_archived,
+            is_spam=req.is_spam,
+        )
+        synced = synced and ok
+        if ok:
+            archived = req.is_archived if req.is_archived is not None else (True if req.is_spam else None)
+            for msg_id in all_ids:
+                update_processed_email_state(
+                    message_id_or_pk=msg_id,
+                    is_unread=req.is_unread,
+                    is_archived=archived,
+                    is_trashed=req.is_trash,
+                )
+            updated_ids.update(all_ids)
+
+    # Part 2: stars are per-message in Gmail.
+    if req.is_starred is True:
+        ok = batch_update_message_states([latest_id], is_starred=True)
+        synced = synced and ok
+        if ok:
+            update_processed_email_state(message_id_or_pk=latest_id, is_starred=True)
+            updated_ids.add(latest_id)
+    elif req.is_starred is False:
+        starred_ids = [r["message_id"] for r in rows if r.get("is_starred")]
+        if starred_ids:
+            ok = batch_update_message_states(starred_ids, is_starred=False)
+            synced = synced and ok
+            if ok:
+                for msg_id in starred_ids:
+                    update_processed_email_state(message_id_or_pk=msg_id, is_starred=False)
+                updated_ids.update(starred_ids)
+
+    dashboard_cache.delete("mails")
+    return {"status": "success", "synced_gmail": synced, "updated_count": len(updated_ids)}
+
+
+@router.post("/threads/{thread_id}/reply")
+def reply_to_thread(thread_id: str, req: ThreadReplyRequest):
+    """Reply in-thread on the thread's LATEST message."""
+    body = (req.body or "").strip()
+    if not body:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Reply body cannot be empty.")
+    if len(body) > 100000:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Reply body is too long (max 100,000 characters).")
+
+    rows = get_thread_messages(thread_id)
+    if not rows:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Thread not found.")
+    latest = rows[-1]
+
+    try:
+        sent_id = reply_to_email(latest["message_id"], body, reply_all=req.reply_all)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except Exception as e:
+        logger.error(f"Error sending reply in thread {thread_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Could not send the reply via Gmail: {str(e)}"
+        )
+    if not sent_id:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Gmail did not return a sent message id.")
+    return {
+        "status": "success",
+        "sent_message_id": sent_id,
+        "thread_id": latest.get("thread_id") or latest.get("message_id"),
     }
 
 
@@ -645,39 +819,55 @@ def bulk_update_mail_state(req: BulkStateRequest):
         "skipped_ids": skipped,
     }
 
+@router.post("/sync/incremental")
+def sync_incremental():
+    """Run one bounded Gmail History incremental sync (see
+    app/services/history_sync.py). Returns the sync result as-is:
+    {"status": "success"|"busy"|"error", "mode": ..., ...}.
+    """
+    return run_incremental_sync()
+
+
+@router.get("/sync/status")
+def get_sync_status():
+    """Current History sync checkpoint (history id, last sync time, mode),
+    or checkpoint=None when no sync has ever run."""
+    checkpoint = get_sync_checkpoint()
+    return {"status": "success", "checkpoint": checkpoint}
+
+
 @router.post("/sync-inbox-state")
 def sync_inbox_from_gmail():
     """
-    Checks Gmail for the current read/unread and starred labels of recent messages,
-    updating TiDB so the web inbox is 100% identical to Gmail.
+    Incremental inbox sync via the Gmail History API.
+
+    Previously this polled the latest 50 rows one by one
+    (sync_inbox_labels_from_gmail) — one Gmail call per message, and it
+    could never see new mail, deletes, or label changes outside those
+    50. Now it runs the bounded History sync and returns how many
+    records changed (added + deleted + label changes).
     """
     try:
-        with get_db_cursor() as cur:
-            cur.execute("SELECT message_id FROM processed_emails ORDER BY id DESC LIMIT 50")
-            rows = cur.fetchall()
-
-        msg_ids = [r["message_id"] for r in rows]
-        if not msg_ids:
-            return {"status": "success", "updated_count": 0}
-
-        updated_states = sync_inbox_labels_from_gmail(msg_ids)
-        for state_item in updated_states:
-            update_processed_email_state(
-                message_id_or_pk=state_item["message_id"],
-                is_unread=state_item["is_unread"],
-                is_starred=state_item["is_starred"],
-                is_archived=state_item.get("is_archived"),
-                is_trashed=state_item.get("is_trash"),
-            )
-
-        dashboard_cache.delete("mails")
-        return {"status": "success", "updated_count": len(updated_states)}
+        result = run_incremental_sync()
     except Exception as e:
-        logger.error(f"Error syncing labels from Gmail: {e}")
+        logger.error(f"Error running incremental sync: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Inbox sync error: {str(e)}"
         )
+    if result.get("status") == "busy":
+        return {"status": "busy", "updated_count": 0}
+    if result.get("status") == "error":
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Inbox sync error: {result.get('error', 'unknown error')}"
+        )
+    processed = result.get("processed", {}) or {}
+    updated_count = int(processed.get("added", 0)) + int(processed.get("deleted", 0)) + int(processed.get("label_changes", 0))
+    if result.get("mode") == "initial" or result.get("mode") == "reconciled":
+        updated_count = int(result.get("added", 0))
+    dashboard_cache.delete("mails")
+    return {"status": "success", "updated_count": updated_count, "mode": result.get("mode"), "has_more": result.get("has_more", False)}
 
 # ================= Configuration Endpoints =================
 

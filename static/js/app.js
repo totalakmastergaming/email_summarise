@@ -4,6 +4,82 @@ var MAILS = [];
 var SEARCH_RESULTS = null;
 /* User-created Gmail labels, loaded once per session. */
 var LABELS_CACHE = null;
+/* Global counts from the last /api/dashboard response (inbox_counts),
+   when the backend provides them. Null = fall back to local counts. */
+var INBOX_COUNTS = null;
+/* Snapshot of the inbox/Primary page-1 threads, used for the dashboard
+   "Recent mail" / "Urgent" panels and tab badges while the user pages
+   through later pages (MAILS then holds the current page only). */
+var PAGE1_MAILS = [];
+/* Pagination: page 1 = no cursor; cursors[i] is the cursor that fetches
+   page i+1. nextCursor/hasMore come from the last /api/mails response. */
+var PAGE_SIZE = 30;
+var pager = { page: 1, cursors: [null], nextCursor: null, hasMore: false, loading: false, error: null };
+/* Last inbox page-load failure message (null = no error). Shown as an
+   inline error row in the inbox list with a Retry button. */
+var inboxLoadError = null;
+/* Current open thread (GET /api/threads/{id}) and its load state. */
+var THREAD = null;
+var THREAD_LOADING = false;
+var THREAD_ERROR = null;
+var threadLoadSeq = 0;
+/* A page fetch queued while another is in flight (cursor to fetch). */
+var pagePending = null;
+
+/* Thread rows are the existing mail object plus thread_id,
+   message_count and unread_count. The row's identity in the UI is its
+   thread id (falling back to the message id for older payloads). */
+function threadKey(m){
+  if(!m) return null;
+  return m.thread_id || m.threadId || m.id;
+}
+function rowByThreadKey(k){
+  if(k == null) return null;
+  var pools = [MAILS, SEARCH_RESULTS, PAGE1_MAILS];
+  for(var i=0;i<pools.length;i++){
+    var p = pools[i];
+    if(!p) continue;
+    for(var j=0;j<p.length;j++){
+      if(String(threadKey(p[j])) === String(k) || String(p[j].id) === String(k)) return p[j];
+    }
+  }
+  return null;
+}
+function normaliseThreadRow(m){
+  if(!m) return m;
+  m.thread_id = m.thread_id || m.threadId || m.id;
+  m.message_count = m.message_count || m.messageCount || 1;
+  if(m.unread_count != null) m.unread = m.unread_count > 0;
+  else if(m.unreadCount != null){ m.unread_count = m.unreadCount; m.unread = m.unread_count > 0; }
+  else m.unread_count = m.unread ? 1 : 0;
+  m.starred = !!m.starred;
+  m.cat = m.cat || "primary";
+  m.archived = !!m.archived;
+  m.trashed = !!m.trashed;
+  return m;
+}
+function normaliseThreadMessage(msg, tid){
+  if(!msg) return msg;
+  msg.thread_id = msg.thread_id || msg.threadId || tid;
+  msg.unread = !!msg.unread;
+  msg.starred = !!msg.starred;
+  msg.cat = msg.cat || "primary";
+  msg.archived = false;
+  msg.trashed = false;
+  msg._expanded = false;
+  return msg;
+}
+/* Dashboard pool: page-1 inbox threads when we have them, else the
+   currently loaded page. */
+function dashPool(){
+  var p = PAGE1_MAILS.length ? PAGE1_MAILS : MAILS;
+  return p.filter(function(m){ return !m.trashed && !m.archived; });
+}
+function countBadge(m){
+  return (m.message_count && m.message_count > 1)
+    ? '<span class="msg-count" title="'+m.message_count+' messages in this thread">'+m.message_count+'</span>'
+    : '';
+}
 
 /* ================= Admin token + API wrapper =================
    Every /api route requires `Authorization: Bearer <ADMIN_TOKEN>` (see
@@ -90,43 +166,56 @@ function tagHtml(m){
   return '<span class="tag grey">'+escapeHtml(m.tag)+'</span>';
 }
 function mailRowHtml(m){
-  return '<div class="mail-row'+(m.unread?" unread":"")+(state.selectedId===m.id?" selected":"")+'" data-open="'+m.id+'" role="button" tabindex="0">'
+  var tk = threadKey(m);
+  return '<div class="mail-row'+(m.unread?" unread":"")+(String(state.selectedId)===String(tk)?" selected":"")+'" data-open="'+tk+'" role="button" tabindex="0">'
     + (m.unread?'<span class="unread-dot"></span>':'<span style="width:8px;flex:none"></span>')
     + '<span class="avatar" style="background:'+avatarColor(m.sender)+'">'+initials(m.sender)+'</span>'
-    + '<span class="mail-main"><span class="mail-line1"><span class="mail-sender">'+escapeHtml(m.sender)+'</span>'+tagHtml(m)+'<span class="mail-time num">'+escapeHtml(m.time)+'</span></span>'
+    + '<span class="mail-main"><span class="mail-line1"><span class="mail-sender">'+escapeHtml(m.sender)+'</span>'+tagHtml(m)+countBadge(m)+'<span class="mail-time num">'+escapeHtml(m.time)+'</span></span>'
     + '<span class="mail-subject" style="display:block">'+escapeHtml(m.subject)+'</span>'
     + '<span class="mail-snip" style="display:block">'+escapeHtml(m.snippet)+'</span></span>'
-    + '<button class="star-btn'+(m.starred?" on":"")+'" data-star="'+m.id+'" aria-label="Star this mail">'+starSvg()+'</button></div>';
+    + '<button class="star-btn'+(m.starred?" on":"")+'" data-star="'+tk+'" aria-label="Star this mail">'+starSvg()+'</button></div>';
 }
 function miniRowHtml(m){
-  return '<button class="mini-mail" data-open="'+m.id+'"><span class="avatar" style="background:'+avatarColor(m.sender)+';width:34px;height:34px;font-size:12px">'+escapeHtml(initials(m.sender))+'</span>'
-    + '<span class="mini-main"><span class="mini-row"><span class="mini-sender">'+escapeHtml(m.sender)+'</span><span class="mini-time num">'+escapeHtml(m.time)+'</span></span>'
+  var tk = threadKey(m);
+  return '<button class="mini-mail" data-open="'+tk+'"><span class="avatar" style="background:'+avatarColor(m.sender)+';width:34px;height:34px;font-size:12px">'+escapeHtml(initials(m.sender))+'</span>'
+    + '<span class="mini-main"><span class="mini-row"><span class="mini-sender">'+escapeHtml(m.sender)+'</span>'+countBadge(m)+'<span class="mini-time num">'+escapeHtml(m.time)+'</span></span>'
     + '<span class="mini-subject" style="display:block">'+escapeHtml(m.subject)+'</span>'
     + '<span class="mini-snip" style="display:block">'+escapeHtml(m.snippet)+'</span></span></button>';
 }
 
 /* ================= Rendering ================= */
 function renderStats(){
-  var c=counts();
+  /* Prefer the global inbox_counts from /api/dashboard when the backend
+     provides them; otherwise count the loaded mail locally. */
+  var c = INBOX_COUNTS ? {
+    unread: INBOX_COUNTS.unread || 0,
+    today: INBOX_COUNTS.today || 0,
+    urgent: INBOX_COUNTS.urgent || 0,
+    reply: INBOX_COUNTS.needs_reply || 0
+  } : counts();
+  var pool = dashPool();
+  var totalThreads = (INBOX_COUNTS && INBOX_COUNTS.total_threads != null)
+    ? INBOX_COUNTS.total_threads
+    : activeMails().length;
   $("#statUnread").textContent=c.unread;
   $("#statToday").textContent=c.today;
   $("#statUrgent").textContent=c.urgent;
   $("#statReply").textContent=c.reply;
   $("#navUnread").textContent=c.unread;
   $("#navUrgent").textContent=c.urgent;
-  $("#statUnreadSub").innerHTML = c.unread>0 ? "Across "+activeMails().length+" conversations in your inbox" : "Inbox zero — nothing unread";
-  $("#statTodaySub").innerHTML = "Since 12:00 AM today · <b>"+activeMails().filter(function(m){return m.today&&m.unread;}).length+" still unread</b>";
-  var firstUrgent = activeMails().filter(function(m){return m.urgent;})[0];
-  var firstReply = activeMails().filter(function(m){return m.needsReply;})[0];
+  $("#statUnreadSub").innerHTML = c.unread>0 ? "Across "+totalThreads+" conversations in your inbox" : "Inbox zero — nothing unread";
+  $("#statTodaySub").innerHTML = "Since 12:00 AM today · <b>"+pool.filter(function(m){return m.today&&m.unread;}).length+" still unread</b>";
+  var firstUrgent = pool.filter(function(m){return m.urgent;})[0];
+  var firstReply = pool.filter(function(m){return m.needsReply;})[0];
   $("#statUrgentSub").innerHTML = firstUrgent ? "Priority: <b>"+escapeHtml(firstUrgent.subject)+"</b>" : "Nothing marked urgent";
   $("#statReplySub").innerHTML = firstReply ? "Waiting from: <b>"+escapeHtml(firstReply.sender)+"</b>" : "No one is waiting on you";
   /* AI brief */
   $("#aiBriefText").innerHTML = "You received <b>"+c.today+" mails today</b>. <b>"+c.urgent+" are urgent</b> and <b>"+c.reply+" threads are waiting for your reply.</b>";
   var pts=[];
-  activeMails().filter(function(m){return m.urgent;}).slice(0,3).forEach(function(m){
+  pool.filter(function(m){return m.urgent;}).slice(0,3).forEach(function(m){
     pts.push("<li><span class='dot'></span><span><b>"+escapeHtml(m.sender)+":</b> "+escapeHtml((m.summary||"").split(".")[0])+".</span></li>");
   });
-  var extra = activeMails().filter(function(m){return m.needsReply && !m.urgent;});
+  var extra = pool.filter(function(m){return m.needsReply && !m.urgent;});
   if(extra.length) pts.push("<li><span class='dot'></span><span>Also awaiting a reply: <b>"+extra.map(function(m){return escapeHtml(m.sender);}).join(", ")+"</b>.</span></li>");
   $("#aiBriefPoints").innerHTML = pts.join("");
 }
@@ -161,36 +250,46 @@ var ICO = {
   forward:'<svg viewBox="0 0 24 24"><path d="M14 9V5l7 7-7 7v-4.1c-5 0-8.5 1.6-11 5.1 1-5 4-10 11-11z"/></svg>'
 };
 function gmRowHtml(m){
-  var sel = !!state.selected[m.id];
-  return '<div class="gm-row'+(m.unread?" unread":"")+(sel?" checked":"")+'" data-open="'+m.id+'" role="button" tabindex="0">'
-    + '<button class="gm-check sm'+(sel?" on":"")+'" data-select="'+m.id+'" aria-label="Select conversation"><span class="box">'+ICO.check+'</span></button>'
-    + '<button class="gm-star'+(m.starred?" on":"")+'" data-star="'+m.id+'" aria-label="Star this mail">'+(m.starred?ICO.starF:ICO.starO)+'</button>'
+  var tk = threadKey(m);
+  var sel = !!state.selected[tk];
+  return '<div class="gm-row'+(m.unread?" unread":"")+(sel?" checked":"")+'" data-open="'+tk+'" role="button" tabindex="0">'
+    + '<button class="gm-check sm'+(sel?" on":"")+'" data-select="'+tk+'" aria-label="Select conversation"><span class="box">'+ICO.check+'</span></button>'
+    + '<button class="gm-star'+(m.starred?" on":"")+'" data-star="'+tk+'" aria-label="Star this mail">'+(m.starred?ICO.starF:ICO.starO)+'</button>'
     + '<span class="gm-avatar" style="background:'+avatarColor(m.sender)+'">'+initials(m.sender)+'</span>'
     + '<span class="gm-sender">'+escapeHtml(m.sender)+'</span>'
-    + '<span class="gm-mid"><span class="gm-subj">'+escapeHtml(m.subject)+'</span><span class="gm-snip"> — '+escapeHtml(m.snippet)+'</span></span>'
+    + '<span class="gm-mid"><span class="gm-subj">'+escapeHtml(m.subject)+'</span>'+countBadge(m)+'<span class="gm-snip"> — '+escapeHtml(m.snippet)+'</span></span>'
     + '<span class="gm-labelchip">'+escapeHtml(m.tag)+'</span>'
     + '<span class="gm-date num">'+escapeHtml(m.time)+'</span>'
     + '<span class="gm-actions">'
-    + '<button class="gm-tbtn sm" data-act="archive" data-id="'+m.id+'" aria-label="Archive">'+ICO.archive+'</button>'
-    + '<button class="gm-tbtn sm" data-act="trash" data-id="'+m.id+'" aria-label="Delete">'+ICO.trash+'</button>'
-    + '<button class="gm-tbtn sm" data-act="read" data-id="'+m.id+'" aria-label="Mark as '+(m.unread?"read":"unread")+'">'+(m.unread?ICO.mailOpen:ICO.mailClosed)+'</button>'
-    + '<button class="gm-tbtn sm" data-act="snooze" data-id="'+m.id+'" aria-label="Snooze">'+ICO.snooze+'</button>'
+    + '<button class="gm-tbtn sm" data-act="archive" data-id="'+tk+'" aria-label="Archive">'+ICO.archive+'</button>'
+    + '<button class="gm-tbtn sm" data-act="trash" data-id="'+tk+'" aria-label="Delete">'+ICO.trash+'</button>'
+    + '<button class="gm-tbtn sm" data-act="read" data-id="'+tk+'" aria-label="Mark as '+(m.unread?"read":"unread")+'">'+(m.unread?ICO.mailOpen:ICO.mailClosed)+'</button>'
+    + '<button class="gm-tbtn sm" data-act="snooze" data-id="'+tk+'" aria-label="Snooze">'+ICO.snooze+'</button>'
     + '</span></div>';
 }
 function selectedIds(){
-  return Object.keys(state.selected).filter(function(k){ return state.selected[k]; }).map(function(k){ return parseInt(k,10); });
+  return Object.keys(state.selected).filter(function(k){ return state.selected[k]; });
 }
 function renderGmailChrome(){
   var list = filteredMails();
-  var rangeTxt = list.length ? "1–"+list.length+" of "+list.length : "0 of 0";
+  /* Real window for the current page — never a total we do not know. */
+  var rangeTxt;
+  if(!list.length) rangeTxt = "0";
+  else { var start = (pager.page - 1) * PAGE_SIZE + 1; rangeTxt = start + "–" + (start + list.length - 1); }
   var r1=$("#gmRange"), r2=$("#gmRange2");
   if(r1) r1.textContent = rangeTxt;
   if(r2) r2.textContent = rangeTxt;
   var fc=$("#gmFootCount");
-  if(fc) fc.textContent = list.length ? list.length+" conversation"+(list.length>1?"s":"")+" in this view" : "No conversations in this view";
-  /* Tab "new" badges = unread in that category */
-  var soc = activeMails().filter(function(m){ return m.cat==="social" && m.unread; }).length;
-  var pro = activeMails().filter(function(m){ return m.cat==="promotions" && m.unread; }).length;
+  if(fc) fc.textContent = list.length ? list.length+" conversation"+(list.length>1?"s":"")+" on this page" : "No conversations in this view";
+  /* Real pager state: Older only when the server says there is more,
+     Newer only past page 1, both off while a page is loading. */
+  var older=$("#gmOlder"), newer=$("#gmNewer");
+  if(older) older.disabled = !pager.hasMore || pager.loading;
+  if(newer) newer.disabled = pager.page <= 1 || pager.loading;
+  /* Tab "new" badges = unread in that category (page-1 pool). */
+  var pool = dashPool();
+  var soc = pool.filter(function(m){ return m.cat==="social" && m.unread; }).length;
+  var pro = pool.filter(function(m){ return m.cat==="promotions" && m.unread; }).length;
   var bs=$("#gmNewSocial"), bp=$("#gmNewPromo");
   if(bs){ bs.hidden = soc===0; bs.textContent = soc+" new"; }
   if(bp){ bp.hidden = pro===0; bp.textContent = pro+" new"; }
@@ -200,7 +299,7 @@ function renderGmailChrome(){
     t.setAttribute("aria-selected", on ? "true" : "false");
   });
   /* Master checkbox + toolbar swap */
-  var visIds = list.map(function(m){ return m.id; });
+  var visIds = list.map(function(m){ return threadKey(m); });
   var allSel = visIds.length>0 && visIds.every(function(id){ return state.selected[id]; });
   var master=$("#gmMaster"); if(master) master.classList.toggle("on", allSel);
   var n = selectedIds().length;
@@ -218,61 +317,186 @@ function renderGmailChrome(){
   if(fb){ fb.hidden = !label; if(label) ft.textContent = label; }
 }
 function renderLists(){
-  var urgent = activeMails().filter(function(m){return m.urgent;});
+  var pool = dashPool();
+  var urgent = pool.filter(function(m){return m.urgent;});
   $("#urgentList").innerHTML = urgent.length ? urgent.map(miniRowHtml).join("") : '<div class="empty">Nothing urgent right now.</div>';
-  $("#recentList").innerHTML = activeMails().slice(0,5).map(mailRowHtml).join("");
+  $("#recentList").innerHTML = pool.slice(0,5).map(mailRowHtml).join("");
   var list = filteredMails();
   var emptyMsg = state.query ? "No mail matches your search." : (state.cat==="social" ? "No social mail here." : state.cat==="promotions" ? "No promotions here." : "Your Primary tab is empty.");
-  $("#inboxList").innerHTML = list.length ? list.map(gmRowHtml).join("") : '<div class="gm-empty">'+emptyMsg+'</div>';
+  var html = "";
+  /* A failed page load keeps the existing list on screen and adds this
+     error row on top; with nothing loaded it is the whole list area. */
+  if(inboxLoadError) html += '<div class="gm-error" role="alert"><span>'+escapeHtml(inboxLoadError)+'</span><button class="gm-retry" data-retry-page>Retry</button></div>';
+  if(list.length) html += list.map(gmRowHtml).join("");
+  else if(!inboxLoadError) html += '<div class="gm-empty">'+emptyMsg+'</div>';
+  $("#inboxList").innerHTML = html;
   renderGmailChrome();
 }
 function currentMail(){
-  for(var i=0;i<MAILS.length;i++){ if(MAILS[i].id===state.selectedId) return MAILS[i]; }
-  return null;
+  return rowByThreadKey(state.selectedId);
+}
+/* ================= Thread reader ================= */
+function threadMessages(){ return (THREAD && THREAD.messages) || []; }
+function latestThreadMessage(){ var ms = threadMessages(); return ms.length ? ms[ms.length - 1] : null; }
+/* Fill a message's renderable body from body_text (preferred) or
+   sanitised body_html, mirroring loadFullBody. */
+function fillMessageBody(msg, bodyText, bodyHtml){
+  var txt = (bodyText || "").trim();
+  if(txt){
+    msg._bodyText = txt;
+    /* Escape first, then turn newlines into <br> — the <br> stays live
+       HTML while the mail text itself cannot inject markup. */
+    msg.body = txt.split(/\n{2,}/).map(function(p){ return escapeHtml(p).replace(/\n/g, "<br>"); });
+    msg.bodyHtml = "";
+    msg._bodyIsHtml = true;
+    msg._fullLoaded = true;
+    msg._bodyError = false;
+  } else if(bodyHtml){
+    msg.body = [];
+    msg.bodyHtml = stripUnsafeHtml(bodyHtml);
+    msg._bodyIsHtml = false;
+    msg._fullLoaded = true;
+    msg._bodyError = false;
+  }
+}
+function messageBodyHtml(msg){
+  if(msg.bodyHtml) return '<div class="gm-body-html">' + msg.bodyHtml + '</div>';
+  if(msg._bodyIsHtml) return (msg.body || []).map(function(p){ return "<p>"+p+"</p>"; }).join("");
+  return (msg.body || [msg.snippet || ""]).map(function(p){ return "<p>"+escapeHtml(p)+"</p>"; }).join("");
+}
+function threadMessageHtml(msg, isLatest){
+  var expanded = isLatest || !!msg._expanded;
+  var head = '<div class="thread-msg-head">'
+    + '<span class="avatar" style="background:'+avatarColor(msg.sender || "")+'">'+initials(msg.sender || "?")+'</span>'
+    + '<span class="thread-msg-who"><span class="thread-msg-name">'+escapeHtml(msg.sender || "")+'</span>'
+    + '<span class="thread-msg-email">&lt;'+escapeHtml(msg.email || "")+'&gt;</span></span>'
+    + '<span class="thread-msg-meta">'
+    + (msg.unread ? '<span class="msg-unread">Unread</span>' : '')
+    + '<span class="thread-msg-date num">'+escapeHtml(msg.time || "")+'</span>'
+    + '<button class="gm-star'+(msg.starred?" on":"")+'" data-msg-star="'+escapeHtml(String(msg.id))+'" aria-label="Star this message">'+(msg.starred?ICO.starF:ICO.starO)+'</button>'
+    + (expanded ? '' : '<button class="gm-textbtn" data-expand-msg="'+escapeHtml(String(msg.id))+'">Show message</button>')
+    + '</span></div>';
+  if(!expanded){
+    return '<div class="thread-msg collapsed">'+head
+      + '<div class="thread-msg-snip">'+escapeHtml(msg.subject || "")+' — '+escapeHtml(msg.snippet || "")+'</div></div>';
+  }
+  var bodyPart;
+  if(msg._bodyError){
+    bodyPart = '<div class="gm-error" role="alert"><span>Couldn\'t load this message</span><button class="gm-retry" data-retry-body="'+escapeHtml(String(msg.id))+'">Retry</button></div>';
+  } else if(msg._fullLoading){
+    bodyPart = '<div class="gm-empty">Loading message…</div>';
+  } else if(THREAD.body_error && isLatest && !msg._fullLoaded){
+    bodyPart = '<div class="gm-error" role="alert"><span>'+escapeHtml(THREAD.body_error)+'</span><button class="gm-retry" data-retry-thread="'+escapeHtml(String(THREAD.thread_id))+'">Retry</button></div>';
+  } else {
+    bodyPart = '<div class="gm-body">'+messageBodyHtml(msg)+'</div>';
+  }
+  return '<div class="thread-msg'+(isLatest?" latest":"")+'">'+head+bodyPart+'</div>';
+}
+function recipientCount(msg){
+  var n = 0;
+  ["to", "recipients", "cc"].forEach(function(k){
+    var v = msg[k];
+    if(Array.isArray(v)) n = Math.max(n, v.length);
+    else if(typeof v === "string" && v.trim()) n = Math.max(n, v.split(",").filter(function(s){ return s.trim(); }).length);
+  });
+  return n;
+}
+/* Show "Reply all" when the thread has other participants: more than
+   one distinct sender, or a message with several recipients; when in
+   doubt, whenever the thread has more than one message. */
+function threadShowReplyAll(){
+  var msgs = threadMessages();
+  if(!msgs.length) return false;
+  var senders = {};
+  msgs.forEach(function(x){ if(x.sender) senders[x.sender] = 1; });
+  if(Object.keys(senders).length > 1) return true;
+  for(var i=0;i<msgs.length;i++){ if(recipientCount(msgs[i]) > 1) return true; }
+  return msgs.length > 1;
+}
+async function loadThread(threadId){
+  var seq = ++threadLoadSeq;
+  THREAD_LOADING = true;
+  THREAD_ERROR = null;
+  renderReader();
+  try {
+    var res = await apiFetch("/api/threads/" + encodeURIComponent(threadId));
+    var d = await res.json().catch(function(){ return {}; });
+    if(seq !== threadLoadSeq) return;
+    if(!res.ok || d.status !== "success" || !d.thread) throw new Error((d && d.detail) || "Couldn't load this conversation");
+    var t = d.thread;
+    var tid = t.thread_id || threadId;
+    THREAD = {
+      thread_id: tid,
+      messages: (t.messages || []).map(function(msg){ return normaliseThreadMessage(msg, tid); }),
+      body_error: t.body_error || d.body_error || null
+    };
+    THREAD.messages.forEach(function(msg, i, arr){ msg._expanded = (i === arr.length - 1); });
+    var latest = latestThreadMessage();
+    if(latest){
+      fillMessageBody(latest, latest.body_text, latest.body_html);
+      if(!latest._fullLoaded) loadFullBody(latest);
+    }
+  } catch(e){
+    if(seq !== threadLoadSeq) return;
+    THREAD = null;
+    THREAD_ERROR = (e && e.message) || "Couldn't load this conversation";
+    toast(THREAD_ERROR);
+  } finally {
+    if(seq !== threadLoadSeq) return;
+    THREAD_LOADING = false;
+    renderReader();
+  }
 }
 function renderReader(){
   var listEl=$("#gmailList"), readEl=$("#gmailRead"), box=$("#reader");
   var m = state.reading ? currentMail() : null;
   if(!m || m.trashed || m.archived){
     state.reading=false;
+    THREAD=null; THREAD_ERROR=null; THREAD_LOADING=false;
     if(listEl) listEl.hidden=false;
     if(readEl) readEl.hidden=true;
     return;
   }
   if(listEl) listEl.hidden=true;
   if(readEl) readEl.hidden=false;
+  var tkey = threadKey(m);
   var list=filteredMails();
-  var idx=list.indexOf(m);
+  var idx=-1;
+  for(var i=0;i<list.length;i++){ if(String(threadKey(list[i]))===String(tkey)){ idx=i; break; } }
   var rr=$("#gmReadRange");
   if(rr) rr.textContent = idx>-1 ? (idx+1)+" of "+list.length : "";
   var pv=$("#gmPrev"), nx=$("#gmNext");
   if(pv) pv.disabled = idx<=0;
   if(nx) nx.disabled = idx<0 || idx>=list.length-1;
-  /* Body rendering: full-body paragraphs are escaped at load time and
-     already contain <br> separators (m._bodyIsHtml), so they are NOT
-     escaped again here; the snippet fallback is raw text and IS escaped.
-     HTML-only mail renders through the sanitiser into .gm-body-html. */
-  var bodyHtml;
-  if(m.bodyHtml){
-    bodyHtml = '<div class="gm-body-html">' + m.bodyHtml + '</div>';
-  } else if(m._bodyIsHtml){
-    bodyHtml = (m.body || []).map(function(p){return "<p>"+p+"</p>";}).join("");
-  } else {
-    bodyHtml = (m.body || [m.snippet || ""]).map(function(p){return "<p>"+escapeHtml(p)+"</p>";}).join("");
+  if(THREAD_ERROR){
+    box.innerHTML =
+      '<div class="gm-subject-row"><h2>'+escapeHtml(m.subject)+'</h2></div>'
+      + '<div class="gm-error" role="alert"><span>'+escapeHtml(THREAD_ERROR)+'</span><button class="gm-retry" data-retry-thread="'+escapeHtml(String(tkey))+'">Retry</button></div>';
+    return;
   }
+  if(THREAD_LOADING || !THREAD || String(THREAD.thread_id)!==String(tkey)){
+    box.innerHTML =
+      '<div class="gm-subject-row"><h2>'+escapeHtml(m.subject)+'</h2></div>'
+      + '<div class="gm-empty">Loading conversation…</div>';
+    return;
+  }
+  var msgs = THREAD.messages;
+  if(!msgs.length){
+    box.innerHTML =
+      '<div class="gm-subject-row"><h2>'+escapeHtml(m.subject)+'</h2></div>'
+      + '<div class="gm-empty">No messages in this conversation.</div>';
+    return;
+  }
+  var latest = msgs[msgs.length-1];
   box.innerHTML =
-    '<div class="gm-subject-row"><h2>'+escapeHtml(m.subject)+'</h2><span class="gm-labelchip">Inbox</span><span class="gm-labelchip">'+escapeHtml(m.tag)+'</span></div>'
-    + '<div class="gm-from"><span class="avatar" style="background:'+avatarColor(m.sender)+'">'+initials(m.sender)+'</span>'
-    + '<div class="gm-from-main"><div class="gm-from-line1"><span class="gm-from-name">'+escapeHtml(m.sender)+'</span><span class="gm-from-email">&lt;'+escapeHtml(m.email)+'&gt;</span>'
-    + '<span class="gm-from-right"><span class="gm-from-date num">'+escapeHtml(m.time)+'</span>'
-    + '<button class="gm-star'+(m.starred?" on":"")+'" data-star="'+m.id+'" aria-label="Star this mail">'+(m.starred?ICO.starF:ICO.starO)+'</button>'
-    + '<button class="gm-tbtn sm" id="gmHeadReply" aria-label="Reply">'+ICO.reply+'</button></span></div>'
-    + '<div class="gm-from-to">to me</div></div></div>'
+    '<div class="gm-subject-row"><h2>'+escapeHtml(latest.subject || m.subject)+'</h2><span class="gm-labelchip">Inbox</span><span class="gm-labelchip">'+escapeHtml(m.tag)+'</span>'+countBadge(m)+'</div>'
     + '<div class="gm-ai"><h3><svg viewBox="0 0 24 24"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9Z"/></svg>AI summary</h3><p>'+escapeHtml(m.summary)+'</p></div>'
-    + '<div class="gm-body">'+bodyHtml+'</div>'
+    + msgs.map(function(msg, i){ return threadMessageHtml(msg, i===msgs.length-1); }).join("")
     + '<div class="gm-reply-btns"><button class="gm-pill" id="gmReplyBtn">'+ICO.reply+'Reply</button>'
     + '<button class="gm-pill" id="gmForwardBtn">'+ICO.forward+'Forward</button></div>'
-    + '<div class="gm-replybox" id="gmReplyBox" hidden><textarea id="replyText" placeholder="Reply to '+escapeHtml(m.sender)+'…"></textarea>'
+    + '<div class="gm-replybox" id="gmReplyBox" hidden>'
+    + (threadShowReplyAll() ? '<label class="gm-replyall"><input type="checkbox" id="replyAllCheck"> Reply all</label>' : '')
+    + '<textarea id="replyText" placeholder="Reply to '+escapeHtml(latest.sender)+'…"></textarea>'
     + '<div class="gm-reply-actions"><button class="gm-send" id="replyMailto">Send</button>'
     + '<button class="gm-textbtn" id="replyDraft">Draft with AI</button>'
     + '<button class="gm-textbtn" id="replyCopy">Copy text</button></div></div>';
@@ -281,20 +505,19 @@ function renderReader(){
     var rt=$("#replyText"); if(rt) rt.focus();
   }
   var rb1=$("#gmReplyBtn"); if(rb1) rb1.addEventListener("click",openReplyBox);
-  var rb2=$("#gmHeadReply"); if(rb2) rb2.addEventListener("click",openReplyBox);
   var fw=$("#gmForwardBtn");
   if(fw) fw.addEventListener("click",function(){
     /* Forward opens the compose box prefilled (sent via the Gmail API
        on submit), instead of a mailto: draft. */
     var to=$("#cTo"), sub=$("#cSubject"), bod=$("#cBody");
     if(to) to.value="";
-    if(sub) sub.value="Fwd: "+m.subject;
-    if(bod) bod.value="\n\n---------- Forwarded message ----------\nFrom: "+m.sender+" <"+m.email+">\nSubject: "+m.subject+"\n\n"+(m._bodyText || m.snippet || "");
+    if(sub) sub.value="Fwd: "+(latest.subject || m.subject);
+    if(bod) bod.value="\n\n---------- Forwarded message ----------\nFrom: "+latest.sender+" <"+latest.email+">\nSubject: "+(latest.subject || m.subject)+"\n\n"+(latest._bodyText || latest.snippet || "");
     openCompose();
   });
   var draftBtn=$("#replyDraft");
   if(draftBtn) draftBtn.addEventListener("click",function(){
-    var rt=$("#replyText"); if(rt) rt.value = draftReply(m);
+    var rt=$("#replyText"); if(rt) rt.value = draftReply(latest);
     toast("Draft added — edit it before sending");
   });
   var mailBtn=$("#replyMailto");
@@ -303,9 +526,10 @@ function renderReader(){
     if(!v){ toast("Write a reply first"); return; }
     mailBtn.disabled=true; mailBtn.textContent="Sending…";
     try {
-      var res = await apiFetch("/api/mails/" + m.id + "/reply", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ body: v }) });
+      var allBox=$("#replyAllCheck");
+      var res = await apiFetch("/api/threads/" + encodeURIComponent(String(tkey)) + "/reply", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ body: v, reply_all: !!(allBox && allBox.checked) }) });
       var d = await res.json().catch(function(){ return {}; });
-      if(res.ok){ toast("Reply sent"); var rb=$("#gmReplyBox"); if(rb) rb.hidden=true; $("#replyText").value=""; }
+      if(res.ok){ toast("Reply sent"); var rb=$("#gmReplyBox"); if(rb) rb.hidden=true; var rt=$("#replyText"); if(rt) rt.value=""; loadThread(String(tkey)); }
       else { toast(d.detail || "Couldn't send the reply"); }
     } catch(e){ toast("Couldn't send the reply — check connection"); }
     finally { mailBtn.disabled=false; mailBtn.textContent="Send"; }
@@ -326,11 +550,17 @@ function draftReply(m){
 function saveLocalState(){
   try {
     var stateData = { starred:{}, read:{}, archived:{}, trashed:{} };
-    MAILS.forEach(function(m){
-      stateData.starred[m.id] = !!m.starred;
-      stateData.read[m.id] = !m.unread;
-      stateData.archived[m.id] = !!m.archived;
-      stateData.trashed[m.id] = !!m.trashed;
+    var seen = {};
+    [MAILS, PAGE1_MAILS, SEARCH_RESULTS].forEach(function(pool){
+      if(!pool) return;
+      pool.forEach(function(m){
+        if(seen[m.id]) return;
+        seen[m.id] = true;
+        stateData.starred[m.id] = !!m.starred;
+        stateData.read[m.id] = !m.unread;
+        stateData.archived[m.id] = !!m.archived;
+        stateData.trashed[m.id] = !!m.trashed;
+      });
     });
     localStorage.setItem("inboxcura_mail_state", JSON.stringify(stateData));
   } catch(e){}
@@ -345,9 +575,12 @@ function applyLocalState(){
     var raw = localStorage.getItem("inboxcura_mail_state");
     if(!raw) return;
     var s = JSON.parse(raw);
-    MAILS.forEach(function(m){
-      if(s.starred && s.starred[m.id] !== undefined) m.starred = !!s.starred[m.id];
-      if(s.read && s.read[m.id] !== undefined) m.unread = !s.read[m.id];
+    [MAILS, PAGE1_MAILS, SEARCH_RESULTS].forEach(function(pool){
+      if(!pool) return;
+      pool.forEach(function(m){
+        if(s.starred && s.starred[m.id] !== undefined) m.starred = !!s.starred[m.id];
+        if(s.read && s.read[m.id] !== undefined) m.unread = !s.read[m.id];
+      });
     });
   } catch(e){}
 }
@@ -395,13 +628,150 @@ $("#navScrim").addEventListener("click",function(){ $("#sidebar").classList.remo
 function setFilter(f){
   state.filter=f;
   state.selected={};
+  /* Folder change resets pagination to page 1 and reloads from the server. */
+  resetPager();
   renderLists();
+  fetchPage(null);
 }
 function setCategory(c){
   state.cat=c;
   state.filter="all";
   state.selected={};
+  /* Category-tab change resets pagination to page 1 and reloads. */
+  resetPager();
   renderLists();
+  fetchPage(null);
+}
+
+/* ================= Pagination + thread state ================= */
+function currentFolder(){
+  if(state.filter==="starred") return "starred";
+  if(state.filter==="unread") return "unread";
+  if(state.filter==="urgent") return "urgent";
+  if(state.filter==="reply") return "reply";
+  return "inbox";
+}
+function resetPager(){
+  pager.page = 1;
+  pager.cursors = [null];
+  pager.nextCursor = null;
+  pager.hasMore = false;
+  pager.error = null;
+  inboxLoadError = null;
+}
+function pageParams(){
+  var q = state.query.trim();
+  var params = { folder: currentFolder(), limit: PAGE_SIZE };
+  /* The category tab only scopes the inbox folder; other folders
+     (starred/unread/urgent/reply) span all categories. */
+  if(params.folder === "inbox" && !q) params.cat = state.cat;
+  if(q) params.q = q;
+  return params;
+}
+function buildMailsUrl(cursor){
+  var p = pageParams();
+  var qs = "limit=" + p.limit + "&folder=" + encodeURIComponent(p.folder);
+  if(p.cat) qs += "&cat=" + encodeURIComponent(p.cat);
+  if(p.q) qs += "&q=" + encodeURIComponent(p.q);
+  if(cursor) qs += "&cursor=" + encodeURIComponent(cursor);
+  return "/api/mails?" + qs;
+}
+async function fetchPage(cursor){
+  /* While a page is loading, queue the newest request instead of
+     racing it — the queue drains in order once the flight lands. */
+  if(pager.loading){ pagePending = cursor; return "queued"; }
+  pager.loading = true;
+  renderGmailChrome();
+  var isSearch = !!state.query.trim();
+  var status = 0;
+  try {
+    var res = await apiFetch(buildMailsUrl(cursor));
+    status = res.status;
+    var d = await res.json().catch(function(){ return {}; });
+    if(!res.ok || d.status !== "success" || !Array.isArray(d.mails)){
+      throw new Error((d && d.detail) || ("Couldn't load mail (" + res.status + ")"));
+    }
+    var rows = d.mails.map(normaliseThreadRow);
+    if(isSearch){ SEARCH_RESULTS = rows; }
+    else { MAILS = rows; SEARCH_RESULTS = null; }
+    pager.nextCursor = d.next_cursor || null;
+    pager.hasMore = !!d.has_more;
+    pager.error = null;
+    inboxLoadError = null;
+    var p = pageParams();
+    if(pager.page === 1 && !isSearch && p.folder === "inbox" && p.cat === "primary") PAGE1_MAILS = rows.slice();
+    applyLocalState();
+    renderAll();
+    return true;
+  } catch(e){
+    if(status === 401 || status === 503){
+      /* The auth notice already explains this; no inbox error box. */
+      pager.error = null;
+      inboxLoadError = null;
+      renderAll();
+      return false;
+    }
+    var msg = (e && e.message) || "Couldn't load this page";
+    pager.error = msg;
+    inboxLoadError = msg;
+    toast(msg + " — try again");
+    renderLists();
+    return false;
+  } finally {
+    pager.loading = false;
+    renderGmailChrome();
+    if(pagePending !== null){ var c = pagePending; pagePending = null; fetchPage(c); }
+  }
+}
+async function goOlder(){
+  if(pager.loading || !pager.hasMore || !pager.nextCursor) return;
+  var c = pager.nextCursor;
+  pager.cursors.push(c);
+  pager.page++;
+  renderGmailChrome();
+  var ok = await fetchPage(c);
+  if(ok === false){ pager.cursors.pop(); pager.page--; renderGmailChrome(); }
+}
+async function goNewer(){
+  if(pager.loading || pager.page <= 1) return;
+  var popped = pager.cursors.pop();
+  pager.page--;
+  renderGmailChrome();
+  var ok = await fetchPage(pager.cursors[pager.cursors.length - 1]);
+  if(ok === false){ pager.cursors.push(popped); pager.page++; renderGmailChrome(); }
+}
+
+function threadStateToBackend(id, payload, quiet){
+  /* POST /api/threads/{id}/state. Returns true only when Gmail
+     accepted the change, so callers flip local state on success only. */
+  return apiFetch("/api/threads/" + encodeURIComponent(id) + "/state", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload)
+  }).then(function(res){
+    return res.json().catch(function(){ return {}; }).then(function(d){
+      if(!res.ok){
+        if(!quiet) toast(d.detail || "Couldn't sync that change with Gmail");
+        return false;
+      }
+      if(d.synced_gmail === false){
+        if(!quiet) toast("Gmail didn't accept that change — nothing was updated");
+        return false;
+      }
+      return true;
+    });
+  }).catch(function(){ if(!quiet) toast("Couldn't reach the server to sync that change"); return false; });
+}
+async function threadBulkState(threadKeys, payload){
+  /* No bulk thread endpoint exists, so the selection toolbar applies
+     the thread state call per thread and returns only the ids Gmail
+     accepted — callers flip local state for those ids only. */
+  var okIds = [];
+  for(var i=0;i<threadKeys.length;i++){
+    var ok = await threadStateToBackend(threadKeys[i], payload, true);
+    if(ok) okIds.push(threadKeys[i]);
+  }
+  return okIds;
 }
 
 function syncStateToBackend(id, payload){
@@ -422,158 +792,226 @@ function syncStateToBackend(id, payload){
   }).catch(function(err){ console.log("State sync note:", err); toast("Couldn't reach the server to sync that change"); return false; });
 }
 
-async function bulkStateToBackend(ids, payload){
-  /* One Gmail batchModify for many mails; returns true only when the
-     server accepted the change, so callers never flip local state on a
-     failed sync. */
-  try {
-    var res = await apiFetch("/api/mails/bulk-state", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(Object.assign({ ids: ids }, payload))
-    });
-    var d = await res.json().catch(function(){ return {}; });
-    if(!res.ok){ toast(d.detail || "Couldn't sync that change with Gmail"); return false; }
-    if(!d.synced_gmail){ toast("Gmail didn't accept that change — nothing was updated"); return false; }
-    return true;
-  } catch(e){
-    toast("Couldn't reach the server to sync that change");
-    return false;
-  }
-}
-
-/* Delegated clicks: open mail + star + Gmail row controls */
+/* Delegated clicks: open mail + star + Gmail row controls + thread
+   expand/retry controls */
 async function loadFullBody(m){
-  /* The inbox list only carries the snippet. Fetch the real body once
-     per mail (GET /api/mails/{id}) and re-render the reader. Plain text
-     is preferred; HTML-only mail falls back to sanitised HTML. */
+  /* Fetch one message's real body (GET /api/mails/{id}) — used for the
+     latest message when the thread payload has no body, and when an
+     earlier message is expanded. A failure sets _bodyError, which the
+     reader renders as a visible error box with a Retry button. */
   if(!m || m._fullLoading || m._fullLoaded) return;
   m._fullLoading = true;
+  m._bodyError = false;
   try {
     var res = await apiFetch("/api/mails/" + m.id);
     var d = await res.json();
     if(res.ok && d.status === "success" && d.mail){
-      var txt = (d.mail.body_text || "").trim();
-      if(txt){
-        /* Keep the raw text for forwarding; the rendered paragraphs
-           below are the escaped version. */
-        m._bodyText = txt;
-        /* Escape first, then turn newlines into <br> — the <br> stays
-           live HTML while the mail text itself cannot inject markup. */
-        m.body = txt.split(/\n{2,}/).map(function(p){ return escapeHtml(p).replace(/\n/g, "<br>"); });
-        m.bodyHtml = "";
-        m._bodyIsHtml = true;
-      } else if(d.mail.body_html){
-        m.body = [];
-        m.bodyHtml = stripUnsafeHtml(d.mail.body_html);
-      }
+      fillMessageBody(m, d.mail.body_text, d.mail.body_html);
+      if(!m._fullLoaded) m._bodyError = true;
       if(d.mail.label_ids) m.labels = d.mail.label_ids.join(",");
-      m._fullLoaded = true;
-      if(state.reading && currentMail() === m) renderReader();
+    } else {
+      m._bodyError = true;
     }
   } catch(e){
-    console.log("Full body load note:", e);
+    m._bodyError = true;
   } finally {
     m._fullLoading = false;
+    if(state.reading) renderReader();
   }
 }
 function openMail(id){
-  state.selectedId=id;
-  state.reading=true;
-  var opened = null;
-  MAILS.forEach(function(m){
-    if(m.id===id){
-      m.unread=false;
-      opened = m;
-      syncStateToBackend(m.id, { is_unread: false });
-    }
-  });
-  if(!opened && SEARCH_RESULTS){
-    SEARCH_RESULTS.forEach(function(m){ if(m.id===id){ opened = m; m.unread=false; syncStateToBackend(m.id, { is_unread: false }); } });
+  var row = rowByThreadKey(id);
+  state.selectedId = id;
+  state.reading = true;
+  THREAD = null;
+  THREAD_ERROR = null;
+  THREAD_LOADING = false;
+  if(row && row.unread){
+    /* Mark the whole thread read; on sync failure restore the unread
+       state instead of showing a read thread Gmail rejected. */
+    var prevUnread = row.unread, prevCount = row.unread_count;
+    row.unread = false;
+    row.unread_count = 0;
+    threadStateToBackend(threadKey(row), { is_unread: false }, true).then(function(ok){
+      if(!ok){
+        row.unread = prevUnread;
+        row.unread_count = prevCount;
+        renderAll();
+        toast("Couldn't mark as read in Gmail — still unread");
+      } else {
+        renderAll();
+      }
+    });
   }
   renderAll();
   showView("inbox");
-  if(opened) loadFullBody(opened);
+  if(row) loadThread(threadKey(row));
+  else {
+    THREAD_ERROR = "Couldn't load this conversation";
+    renderReader();
+  }
 }
 function mailById(id){
-  for(var i=0;i<MAILS.length;i++){ if(MAILS[i].id===id) return MAILS[i]; }
-  if(SEARCH_RESULTS){ for(var j=0;j<SEARCH_RESULTS.length;j++){ if(SEARCH_RESULTS[j].id===id) return SEARCH_RESULTS[j]; } }
-  return null;
+  return rowByThreadKey(id);
 }
 function rowAction(act, m){
   if(!m) return;
+  var tk = threadKey(m);
   if(act==="archive"){
-    syncStateToBackend(m.id, { is_archived: true }).then(function(ok){
+    threadStateToBackend(tk, { is_archived: true }).then(function(ok){
       if(!ok) return;
-      m.archived=true; if(state.selectedId===m.id) state.reading=false; delete state.selected[m.id]; renderAll();
+      m.archived=true; if(String(threadKey(currentMail()))===String(tk)) state.reading=false; delete state.selected[tk]; renderAll();
       toast("Conversation archived");
     });
     return;
   }
   else if(act==="trash"){
-    syncStateToBackend(m.id, { is_trash: true }).then(function(ok){
+    threadStateToBackend(tk, { is_trash: true }).then(function(ok){
       if(!ok) return;
-      m.trashed=true; if(state.selectedId===m.id) state.reading=false; delete state.selected[m.id]; renderAll();
+      m.trashed=true; if(String(threadKey(currentMail()))===String(tk)) state.reading=false; delete state.selected[tk]; renderAll();
       toast("Conversation deleted");
     });
     return;
   }
   else if(act==="spam"){
-    syncStateToBackend(m.id, { is_spam: true }).then(function(ok){
+    threadStateToBackend(tk, { is_spam: true }).then(function(ok){
       if(!ok) return;
-      m.archived=true; if(state.selectedId===m.id) state.reading=false; delete state.selected[m.id]; renderAll();
+      m.archived=true; if(String(threadKey(currentMail()))===String(tk)) state.reading=false; delete state.selected[tk]; renderAll();
       toast("Reported as spam");
     });
     return;
   }
   else if(act==="read"){
-    m.unread = !m.unread;
-    syncStateToBackend(m.id, { is_unread: m.unread });
-    toast(m.unread ? "Marked as unread" : "Marked as read");
+    /* Flip local state only after Gmail confirms — never a
+       success-looking UI for a rejected change. */
+    var target = !m.unread;
+    threadStateToBackend(tk, { is_unread: target }).then(function(ok){
+      if(!ok) return;
+      m.unread = target;
+      m.unread_count = target ? Math.max(1, m.unread_count || 0) : 0;
+      delete state.selected[tk];
+      renderAll();
+      toast(target ? "Marked as unread" : "Marked as read");
+    });
+    return;
   }
   else if(act==="snooze"){ toast("Snooze isn\u2019t available yet \u2014 this mail stays in your inbox"); }
-  delete state.selected[m.id];
+  delete state.selected[tk];
   renderAll();
 }
 document.addEventListener("click",function(e){
+  var mstar=e.target.closest ? e.target.closest("[data-msg-star]") : null;
+  if(mstar){
+    /* Message-level star inside an expanded thread message (single-mail
+       endpoint); the thread row's star follows "any message starred". */
+    e.stopPropagation();
+    var mid=mstar.getAttribute("data-msg-star");
+    var msg=null;
+    threadMessages().forEach(function(x){ if(String(x.id)===mid) msg=x; });
+    if(msg){
+      var mnext=!msg.starred;
+      syncStateToBackend(mid, { is_starred: mnext }).then(function(ok){
+        if(!ok) return;
+        msg.starred=mnext;
+        var row=currentMail();
+        if(row){
+          var any=false;
+          threadMessages().forEach(function(x){ if(x.starred) any=true; });
+          row.starred=any;
+        }
+        renderAll();
+      });
+    }
+    return;
+  }
+  var exp=e.target.closest ? e.target.closest("[data-expand-msg]") : null;
+  if(exp){
+    e.stopPropagation();
+    var eid=exp.getAttribute("data-expand-msg");
+    var emsg=null;
+    threadMessages().forEach(function(x){ if(String(x.id)===eid) emsg=x; });
+    if(emsg){
+      emsg._expanded=true;
+      if(emsg.body_text || emsg.body_html) fillMessageBody(emsg, emsg.body_text, emsg.body_html);
+      else if(!emsg._fullLoaded && !emsg._fullLoading) loadFullBody(emsg);
+      renderReader();
+    }
+    return;
+  }
+  var rbody=e.target.closest ? e.target.closest("[data-retry-body]") : null;
+  if(rbody){
+    e.stopPropagation();
+    var bid=rbody.getAttribute("data-retry-body");
+    var bmsg=null;
+    threadMessages().forEach(function(x){ if(String(x.id)===bid) bmsg=x; });
+    if(bmsg){ bmsg._bodyError=false; bmsg._fullLoaded=false; loadFullBody(bmsg); renderReader(); }
+    return;
+  }
+  var rthread=e.target.closest ? e.target.closest("[data-retry-thread]") : null;
+  if(rthread){
+    e.stopPropagation();
+    loadThread(rthread.getAttribute("data-retry-thread"));
+    return;
+  }
+  var rpage=e.target.closest ? e.target.closest("[data-retry-page]") : null;
+  if(rpage){
+    e.stopPropagation();
+    fetchPage(pager.cursors[pager.cursors.length - 1]);
+    return;
+  }
   var star=e.target.closest ? e.target.closest("[data-star]") : null;
   if(star){
+    /* Thread-level star: flip only after Gmail confirms. Starring
+       applies to the latest message; unstarring clears the thread. */
     e.stopPropagation();
-    var sid=parseInt(star.getAttribute("data-star"),10);
-    MAILS.forEach(function(m){
-      if(m.id===sid){
-        m.starred=!m.starred;
-        syncStateToBackend(m.id, { is_starred: m.starred });
-      }
-    });
-    renderAll(); return;
+    var tk=star.getAttribute("data-star");
+    var row=rowByThreadKey(tk);
+    if(row){
+      var next=!row.starred;
+      threadStateToBackend(tk, { is_starred: next }).then(function(ok){
+        if(!ok) return;
+        row.starred=next;
+        if(THREAD && String(THREAD.thread_id)===String(tk)){
+          THREAD.messages.forEach(function(x, i, arr){
+            if(next){ if(i===arr.length-1) x.starred=true; }
+            else x.starred=false;
+          });
+        }
+        renderAll();
+      });
+    }
+    return;
   }
   var sel=e.target.closest ? e.target.closest("[data-select]") : null;
   if(sel){
     e.stopPropagation();
-    var cid=parseInt(sel.getAttribute("data-select"),10);
+    var cid=sel.getAttribute("data-select");
     state.selected[cid]=!state.selected[cid];
     renderLists(); renderReader(); return;
   }
   var act=e.target.closest ? e.target.closest("[data-act]") : null;
   if(act){
     e.stopPropagation();
-    rowAction(act.getAttribute("data-act"), mailById(parseInt(act.getAttribute("data-id"),10)));
+    rowAction(act.getAttribute("data-act"), mailById(act.getAttribute("data-id")));
     return;
   }
   var open=e.target.closest ? e.target.closest("[data-open]") : null;
   if(open){
-    openMail(parseInt(open.getAttribute("data-open"),10));
+    openMail(open.getAttribute("data-open"));
   }
 });
 async function markAll(){
-  var unreadIds = activeMails().filter(function(m){ return m.unread; }).map(function(m){ return m.id; });
-  if(!unreadIds.length){ toast("Nothing unread"); return; }
-  var ok = await bulkStateToBackend(unreadIds, { is_unread: false });
-  if(!ok) return;
-  activeMails().forEach(function(m){ m.unread=false; });
+  var unreadThreads = activeMails().filter(function(m){ return m.unread; });
+  if(!unreadThreads.length){ toast("Nothing unread"); return; }
+  var ids = unreadThreads.map(function(m){ return threadKey(m); });
+  var okIds = await threadBulkState(ids, { is_unread: false });
+  if(!okIds.length){ toast("Couldn't sync that change with Gmail"); return; }
+  okIds.forEach(function(tk){
+    var m = rowByThreadKey(tk);
+    if(m){ m.unread=false; m.unread_count=0; }
+  });
   renderAll();
-  toast("All mail marked as read");
+  toast(okIds.length===ids.length ? "All mail marked as read" : "Marked "+okIds.length+" of "+ids.length+" as read — the rest didn't sync");
 }
 $("#markAllBtn").addEventListener("click",markAll);
 
@@ -589,16 +1027,21 @@ $("#searchInput").addEventListener("input",function(e){
   if(searchTimer) clearTimeout(searchTimer);
   if(q.length >= 2){
     searchTimer = setTimeout(function(){
-      apiFetch("/api/mails?q=" + encodeURIComponent(q)).then(function(res){ return res.json(); }).then(function(d){
-        if(d.status === "success" && Array.isArray(d.mails)){
-          SEARCH_RESULTS = d.mails;
-          SEARCH_RESULTS.forEach(function(m){ m.cat = m.cat || "primary"; m.archived = false; m.trashed = false; });
-          renderLists(); renderReader();
-        }
-      }).catch(function(){});
+      /* Server search goes through the same paged loader (page 1);
+         a failed search keeps the local matches and shows a visible
+         error row with Retry instead of failing silently. */
+      resetPager();
+      fetchPage(null);
     }, 350);
   } else {
-    SEARCH_RESULTS = null;
+    if(SEARCH_RESULTS){
+      /* Leaving an active server search reloads the inbox page 1. */
+      SEARCH_RESULTS = null;
+      resetPager();
+      fetchPage(null);
+    } else {
+      SEARCH_RESULTS = null;
+    }
   }
   renderLists(); renderReader();
 });
@@ -734,7 +1177,7 @@ $("#gmMore").addEventListener("click",function(e){ e.stopPropagation(); var m=$(
 document.addEventListener("click",function(e){ if(!e.target.closest || !e.target.closest(".gm-menu")) closeMenus(); });
 function selectWhere(fn){
   state.selected={};
-  filteredMails().forEach(function(m){ if(fn(m)) state.selected[m.id]=true; });
+  filteredMails().forEach(function(m){ if(fn(m)) state.selected[threadKey(m)]=true; });
   renderLists();
 }
 $$("#gmSelectMenu [data-selmenu]").forEach(function(b){
@@ -757,18 +1200,18 @@ $$("#gmMoreMenu [data-moremenu]").forEach(function(b){
 });
 $("#gmMaster").addEventListener("click",function(){
   var list=filteredMails();
-  var allSel=list.length>0 && list.every(function(m){ return state.selected[m.id]; });
-  if(allSel){ list.forEach(function(m){ delete state.selected[m.id]; }); }
-  else { list.forEach(function(m){ state.selected[m.id]=true; }); }
+  var allSel=list.length>0 && list.every(function(m){ return state.selected[threadKey(m)]; });
+  if(allSel){ list.forEach(function(m){ delete state.selected[threadKey(m)]; }); }
+  else { list.forEach(function(m){ state.selected[threadKey(m)]=true; }); }
   renderLists();
 });
 $("#gmMaster2").addEventListener("click",function(){ state.selected={}; renderLists(); });
 
 $("#gmFilterClear").addEventListener("click",function(){
-  state.filter="all"; state.query=""; state.selected={};
+  state.query=""; state.selected={};
   SEARCH_RESULTS = null;
   var si=$("#searchInput"); if(si) si.value="";
-  renderLists();
+  setFilter("all");
 });
 /* ================= Labels =================
    The label button used to toast "Labels are shown on each
@@ -780,9 +1223,15 @@ async function loadLabels(){
   try {
     var res = await apiFetch("/api/labels");
     var d = await res.json();
-    LABELS_CACHE = (res.ok && d.status === "success") ? (d.labels || []) : [];
-  } catch(e){ LABELS_CACHE = []; }
-  return LABELS_CACHE;
+    if(res.ok && d.status === "success"){
+      LABELS_CACHE = d.labels || [];
+      return LABELS_CACHE;
+    }
+    return null;
+  } catch(e){
+    /* A failed fetch is not an empty label list — callers must say so. */
+    return null;
+  }
 }
 function mailLabelIds(m){
   return (m.labels || "").split(",").map(function(s){ return s.trim(); }).filter(Boolean);
@@ -792,6 +1241,10 @@ async function openLabelMenu(anchorBtn, ids){
   if(!menu) return;
   var labels = await loadLabels();
   closeMenus();
+  if(labels === null){
+    toast("Couldn't load labels — try again");
+    return;
+  }
   if(!labels.length){
     toast("No labels yet — create one in Gmail first");
     return;
@@ -823,8 +1276,12 @@ async function openLabelMenu(anchorBtn, ids){
 async function applyLabelToMails(ids, labelId, add){
   var done = 0;
   for(var i=0;i<ids.length;i++){
+    /* Labels are a single-message endpoint: apply to the thread row's
+       message id (the row's .id), not the thread id. */
+    var row = mailById(ids[i]);
+    var mid = (row && row.id != null) ? row.id : ids[i];
     try {
-      var res = await apiFetch("/api/mails/" + ids[i] + "/labels", {
+      var res = await apiFetch("/api/mails/" + mid + "/labels", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(add ? { add: [labelId] } : { remove: [labelId] })
@@ -853,17 +1310,20 @@ $$("#gmBarSel [data-selact]").forEach(function(b){
     if(act==="snooze"){ toast("Snooze isn\u2019t available yet \u2014 these mails stay in your inbox"); state.selected={}; renderAll(); return; }
     if(act==="label"){ openLabelMenu(b, ids); return; }
     var payload = act==="archive" ? { is_archived: true } : act==="trash" ? { is_trash: true } : act==="spam" ? { is_spam: true } : { is_unread: false };
-    bulkStateToBackend(ids, payload).then(function(ok){
-      if(!ok) return;
-      ids.forEach(function(id){
-        var m=mailById(id); if(!m) return;
+    /* Thread state is applied per thread (no bulk thread endpoint);
+       local state flips only for the threads Gmail accepted. */
+    threadBulkState(ids, payload).then(function(okIds){
+      if(!okIds.length){ toast("Couldn't sync that change with Gmail"); return; }
+      okIds.forEach(function(tk){
+        var m=rowByThreadKey(tk); if(!m) return;
         if(act==="archive" || act==="spam") m.archived=true;
         else if(act==="trash") m.trashed=true;
-        else if(act==="read") m.unread=false;
+        else if(act==="read"){ m.unread=false; m.unread_count=0; }
       });
       state.selected={};
       renderAll();
-      toast(act==="archive" ? "Conversations archived" : act==="read" ? "Marked as read" : act==="spam" ? "Reported as spam" : "Conversations deleted");
+      if(okIds.length===ids.length) toast(act==="archive" ? "Conversations archived" : act==="read" ? "Marked as read" : act==="spam" ? "Reported as spam" : "Conversations deleted");
+      else toast("Updated "+okIds.length+" of "+ids.length+" — Gmail didn't accept the rest");
     });
   });
 });
@@ -875,7 +1335,15 @@ $("#gmReadTrash").addEventListener("click",function(){ currentAction("trash"); }
 $("#gmReadSpam").addEventListener("click",function(){ currentAction("spam"); });
 $("#gmReadSnooze").addEventListener("click",function(){ toast("Snooze isn\u2019t available yet \u2014 this mail stays in your inbox"); state.reading=false; renderAll(); });
 $("#gmReadUnread").addEventListener("click",function(){
-  var m=currentMail(); if(m){ m.unread=true; syncStateToBackend(m.id, { is_unread: true }); } state.reading=false; renderAll();
+  var m=currentMail(); if(!m) return;
+  var tk=threadKey(m);
+  threadStateToBackend(tk, { is_unread: true }).then(function(ok){
+    if(!ok) return;
+    m.unread=true;
+    m.unread_count=Math.max(1, m.unread_count || 0);
+    state.reading=false;
+    renderAll();
+  });
 });
 $("#gmReadLabel").addEventListener("click",function(){
   var m=currentMail(); if(m) openLabelMenu(this, [m.id]);
@@ -883,12 +1351,17 @@ $("#gmReadLabel").addEventListener("click",function(){
 function stepMail(dir){
   var list=filteredMails();
   var m=currentMail(); if(!m) return;
-  var idx=list.indexOf(m);
+  var idx=-1;
+  for(var i=0;i<list.length;i++){ if(String(threadKey(list[i]))===String(threadKey(m))){ idx=i; break; } }
   var next=list[idx+dir];
-  if(next) openMail(next.id);
+  if(next) openMail(threadKey(next));
 }
 $("#gmPrev").addEventListener("click",function(){ stepMail(-1); });
 $("#gmNext").addEventListener("click",function(){ stepMail(1); });
+/* Real pager: Older/Newer walk the cursor stack (see goOlder/goNewer). */
+var gmOlderBtn=$("#gmOlder"), gmNewerBtn=$("#gmNewer");
+if(gmOlderBtn) gmOlderBtn.addEventListener("click",goOlder);
+if(gmNewerBtn) gmNewerBtn.addEventListener("click",goNewer);
 
 /* ================= Live Backend Integration ================= */
 async function initBackend(){
@@ -900,6 +1373,10 @@ async function initBackend(){
   try {
     var res = await apiFetch("/api/dashboard");
     var data = await res.json();
+    /* Global inbox counts for the dashboard stats, when the backend
+       provides them (renderStats prefers these over local counts). */
+    if(data.inbox_counts) INBOX_COUNTS = data.inbox_counts;
+    else if(data.data && data.data.inbox_counts) INBOX_COUNTS = data.data.inbox_counts;
     if(data.status === "success" || data.status === "warning"){
       var cfg = data.config || {};
       if(cfg.model){
@@ -946,23 +1423,11 @@ async function initBackend(){
     console.log("Initial dashboard load:", e);
   }
 
-  // Load real emails from TiDB
-  try {
-    var mres = await apiFetch("/api/mails");
-    var mdata = await mres.json();
-    if(mdata.status === "success" && Array.isArray(mdata.mails)){
-      MAILS = mdata.mails;
-      MAILS.forEach(function(m){
-        m.cat = m.cat || "primary";
-        m.archived = false;
-        m.trashed = false;
-      });
-      applyLocalState();
-      renderAll();
-    }
-  } catch(e){
-    console.log("Database mails query:", e);
-  }
+  // Load page 1 of the inbox (folder=inbox, cat=primary, limit=30).
+  // fetchPage shows a visible error with Retry in the inbox list if
+  // this fails, instead of leaving an empty list.
+  resetPager();
+  await fetchPage(null);
 }
 
 var syncBtn = $("#syncLiveBtn");
@@ -1229,7 +1694,11 @@ function closeKeyModal(){
 if(closeKeyModalBtn) closeKeyModalBtn.addEventListener("click", closeKeyModal);
 if(cancelKeyModalBtn) cancelKeyModalBtn.addEventListener("click", closeKeyModal);
 
-// Auto-fill default model on provider change per rule 1.3
+// Auto-fill default model on provider change per rule 1.3 — only the
+// two rule-sanctioned defaults (gemini-3.5-flash, openai/gpt-oss-120b).
+// OpenAI has no sanctioned default: the field is left as the user typed
+// it, and the backend requires an explicit model for generic providers
+// instead of silently inventing one.
 var provSelect = $("#keyProvider");
 if(provSelect){
   provSelect.addEventListener("change", function(){
@@ -1237,7 +1706,6 @@ if(provSelect){
     if(km){
       if(this.value === "gemini") km.value = "gemini-3.5-flash";
       else if(this.value === "groq") km.value = "openai/gpt-oss-120b";
-      else if(this.value === "openai") km.value = "gpt-4o-mini";
     }
   });
 }

@@ -1,3 +1,4 @@
+import base64 as _base64
 import json
 import logging
 import threading
@@ -144,6 +145,7 @@ def init_db() -> bool:
                 CREATE TABLE IF NOT EXISTS processed_emails (
                     id INT AUTO_INCREMENT PRIMARY KEY,
                     message_id VARCHAR(255) UNIQUE NOT NULL,
+                    thread_id VARCHAR(255) NULL,
                     sender VARCHAR(255),
                     subject VARCHAR(500),
                     snippet TEXT,
@@ -154,13 +156,21 @@ def init_db() -> bool:
                     is_trashed BOOLEAN DEFAULT FALSE,
                     received_at DATETIME NULL,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    INDEX idx_msg_id (message_id)
+                    INDEX idx_msg_id (message_id),
+                    INDEX idx_thread_id (thread_id)
                 );
             """)
 
             # Safe column additions if table already existed from prior runs
             cur.execute("SHOW COLUMNS FROM processed_emails")
             existing_cols = {row['Field'] for row in cur.fetchall()}
+            if "thread_id" not in existing_cols:
+                # Existing rows keep NULL thread_id; everywhere else NULL is
+                # treated as "own thread" via COALESCE(thread_id, message_id).
+                cur.execute("ALTER TABLE processed_emails ADD COLUMN thread_id VARCHAR(255) NULL")
+            cur.execute("SHOW INDEX FROM processed_emails WHERE Key_name = 'idx_thread_id'")
+            if not cur.fetchall():
+                cur.execute("ALTER TABLE processed_emails ADD INDEX idx_thread_id (thread_id)")
             if "is_unread" not in existing_cols:
                 cur.execute("ALTER TABLE processed_emails ADD COLUMN is_unread BOOLEAN DEFAULT TRUE")
             if "is_starred" not in existing_cols:
@@ -171,6 +181,21 @@ def init_db() -> bool:
                 cur.execute("ALTER TABLE processed_emails ADD COLUMN is_archived BOOLEAN DEFAULT FALSE")
             if "is_trashed" not in existing_cols:
                 cur.execute("ALTER TABLE processed_emails ADD COLUMN is_trashed BOOLEAN DEFAULT FALSE")
+
+            # 1b. Gmail History API sync checkpoint (Phase 1 incremental sync).
+            # One row per Gmail account ("me" — single-user app). history_id
+            # is the last History record id the mirror has applied; the
+            # checkpoint only ever advances AFTER a full history page run
+            # succeeds, so a failed run reprocesses the same records safely
+            # (upserts + label deltas are idempotent).
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS gmail_sync_state (
+                    account_id VARCHAR(100) PRIMARY KEY,
+                    history_id BIGINT NULL,
+                    last_sync_at DATETIME NULL,
+                    last_mode VARCHAR(20) NULL
+                );
+            """)
 
             # 2. Daily executive digest reports archive
             cur.execute("""
@@ -310,9 +335,10 @@ def save_processed_emails(emails_data: list[dict]):
         return
     with get_db_cursor(commit=True) as cur:
         sql = """
-            INSERT INTO processed_emails (message_id, sender, subject, snippet, is_unread, is_starred, labels, received_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            INSERT INTO processed_emails (message_id, thread_id, sender, subject, snippet, is_unread, is_starred, labels, received_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON DUPLICATE KEY UPDATE
+                thread_id = VALUES(thread_id),
                 sender = VALUES(sender),
                 subject = VALUES(subject),
                 snippet = VALUES(snippet),
@@ -331,6 +357,7 @@ def save_processed_emails(emails_data: list[dict]):
             labels_str = ",".join(e.get("label_ids", [])) if isinstance(e.get("label_ids"), list) else e.get("labels", "")
             values.append((
                 e["id"],
+                e.get("thread_id"),
                 e.get("sender", "Unknown"),
                 e.get("subject", "(No Subject)"),
                 e.get("snippet", ""),
@@ -385,6 +412,340 @@ def get_email_by_id_or_msg_id(identifier: Any) -> Optional[dict]:
         else:
             cur.execute("SELECT * FROM processed_emails WHERE message_id = %s", (str(identifier),))
         return cur.fetchone()
+
+
+# ================= Threading, counts & keyset pagination (Phase 1) ====
+
+# Urgent-subject keywords, kept identical to the ones used by the API
+# layer (api.py) so dashboard counts and folder filtering agree.
+_URGENT_SUBJECT_LIKES = ["%urgent%", "%action required%", "%deadline%", "%immediate%", "%alert%"]
+
+# SQL fragment for the "needs a reply" heuristic, mirroring api.py's
+# _needs_reply() in SQL. APPROXIMATION — it cannot know whether the user
+# already replied in the thread (that needs thread history); it only
+# checks unread + Primary category + a non-automated-looking sender and
+# subject. The Python helper remains the source of truth for a single
+# row; this fragment exists so folders/counts can be computed in SQL.
+_NEEDS_REPLY_SQL = """(
+    is_unread = TRUE
+    AND COALESCE(labels, '') NOT LIKE '%CATEGORY_SOCIAL%'
+    AND COALESCE(labels, '') NOT LIKE '%CATEGORY_PROMOTIONS%'
+    AND COALESCE(labels, '') NOT LIKE '%CATEGORY_UPDATES%'
+    AND COALESCE(labels, '') NOT LIKE '%CATEGORY_FORUMS%'
+    AND COALESCE(sender, '') NOT LIKE '%noreply%'
+    AND COALESCE(sender, '') NOT LIKE '%no-reply%'
+    AND COALESCE(sender, '') NOT LIKE '%donotreply%'
+    AND COALESCE(sender, '') NOT LIKE '%do-not-reply%'
+    AND COALESCE(sender, '') NOT LIKE '%notification%'
+    AND COALESCE(sender, '') NOT LIKE '%digest%'
+    AND COALESCE(sender, '') NOT LIKE '%updates@%'
+    AND COALESCE(sender, '') NOT LIKE '%newsletter%'
+    AND COALESCE(subject, '') NOT LIKE '%newsletter%'
+    AND COALESCE(subject, '') NOT LIKE '%digest%'
+    AND COALESCE(subject, '') NOT LIKE '%notification only%'
+    AND COALESCE(subject, '') NOT LIKE '%unsubscribe%'
+    AND COALESCE(subject, '') NOT LIKE '%your receipt%'
+    AND COALESCE(subject, '') NOT LIKE '%order confirmed%'
+    AND COALESCE(subject, '') NOT LIKE '%password reset%'
+    AND COALESCE(subject, '') NOT LIKE '%verify your%'
+)"""
+
+
+def _urgent_subject_sql(alias: str = "") -> str:
+    """`subject LIKE ...` OR-chain for the urgent keywords (alias-aware)."""
+    col = f"{alias}.subject" if alias else "subject"
+    return "(" + " OR ".join(f"{col} LIKE %s" for _ in _URGENT_SUBJECT_LIKES) + ")"
+
+
+def get_thread_messages(thread_id: str) -> list[dict]:
+    """All messages of one thread, chronological.
+
+    ``thread_id`` may be a Gmail threadId or a single message_id: rows
+    stored before threading (thread_id NULL) are their own thread, so
+    the lookup also matches message_id. NULL received_at sorts first
+    in MySQL, so undated rows are pushed last.
+    """
+    with get_db_cursor() as cur:
+        cur.execute(
+            "SELECT * FROM processed_emails "
+            "WHERE thread_id = %s OR message_id = %s "
+            "ORDER BY (received_at IS NULL), received_at ASC, id ASC",
+            (thread_id, thread_id),
+        )
+        return cur.fetchall()
+
+
+def mark_messages_trashed(message_ids: list[str]) -> int:
+    """Soft-trash rows by Gmail message_id (rows are never deleted).
+
+    Used by the History sync for messagesDeleted records. Returns the
+    number of local rows actually marked.
+    """
+    if not message_ids:
+        return 0
+    with get_db_cursor(commit=True) as cur:
+        fmt = ",".join(["%s"] * len(message_ids))
+        cur.execute(
+            f"UPDATE processed_emails SET is_trashed = TRUE WHERE message_id IN ({fmt})",
+            tuple(message_ids),
+        )
+        return cur.rowcount
+
+
+def apply_label_delta(message_id: str, add_labels: Optional[list[str]] = None,
+                      remove_labels: Optional[list[str]] = None) -> bool:
+    """Apply a Gmail label delta to one local row, no Gmail calls.
+
+    Used by the History sync for labelsAdded/labelsRemoved records.
+    The labels CSV is the source of truth; the derived flags are
+    recomputed from it (same derivation as sync_inbox_labels_from_gmail:
+    unread = UNREAD present, starred = STARRED present, archived = INBOX
+    absent, trashed = TRASH present). Returns False when the message is
+    not in TiDB (the record is skipped, not an error).
+    """
+    with get_db_cursor(commit=True) as cur:
+        cur.execute("SELECT labels FROM processed_emails WHERE message_id = %s", (message_id,))
+        row = cur.fetchone()
+        if not row:
+            return False
+        labels = {p.strip() for p in str(row.get("labels") or "").split(",") if p.strip()}
+        labels |= {str(x).strip() for x in (add_labels or []) if str(x).strip()}
+        labels -= {str(x).strip() for x in (remove_labels or []) if str(x).strip()}
+        cur.execute(
+            "UPDATE processed_emails SET labels = %s, is_unread = %s, "
+            "is_starred = %s, is_archived = %s, is_trashed = %s "
+            "WHERE message_id = %s",
+            (
+                ",".join(sorted(labels)),
+                "UNREAD" in labels,
+                "STARRED" in labels,
+                "INBOX" not in labels,
+                "TRASH" in labels,
+                message_id,
+            ),
+        )
+        return True
+
+
+# ---- Gmail History sync checkpoint ----
+
+_SYNC_ACCOUNT_ID = "me"  # Single-user app: the Gmail userId is always "me".
+
+
+def get_sync_checkpoint() -> Optional[dict]:
+    """Current History sync checkpoint, or None if never synced."""
+    with get_db_cursor() as cur:
+        cur.execute("SELECT * FROM gmail_sync_state WHERE account_id = %s", (_SYNC_ACCOUNT_ID,))
+        row = cur.fetchone()
+    if not row:
+        return None
+    return {
+        "account_id": row["account_id"],
+        "history_id": int(row["history_id"]) if row.get("history_id") is not None else None,
+        "last_sync_at": row["last_sync_at"].isoformat() if row.get("last_sync_at") else None,
+        "last_mode": row.get("last_mode"),
+    }
+
+
+def set_sync_checkpoint(history_id: int, mode: str) -> None:
+    """Advance the History checkpoint. Only call AFTER a sync run has
+    fully succeeded — a failed run must leave the old checkpoint in
+    place so its records are reprocessed (safe: upserts + label deltas
+    are idempotent)."""
+    with get_db_cursor(commit=True) as cur:
+        cur.execute(
+            """
+            INSERT INTO gmail_sync_state (account_id, history_id, last_sync_at, last_mode)
+            VALUES (%s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+                history_id = VALUES(history_id),
+                last_sync_at = VALUES(last_sync_at),
+                last_mode = VALUES(last_mode)
+            """,
+            (_SYNC_ACCOUNT_ID, int(history_id), _utcnow_naive(), mode),
+        )
+
+
+def get_inbox_counts() -> dict:
+    """SQL counts for the dashboard, all over non-archived/non-trashed rows.
+
+    - unread: unread rows in the inbox.
+    - today: received today in Asia/Kolkata. received_at is stored as
+      naive UTC; CONVERT_TZ shifts it to IST before taking the date.
+      (Caveat: CONVERT_TZ returns NULL if the server's time-zone tables
+      lack the named offsets — TiDB ships +00:00/+05:30 as fixed offsets,
+      so this is safe here, but if `today` ever reads 0 while mail
+      arrived today, check CONVERT_TZ first.)
+    - urgent: subject matches the urgent keywords.
+    - needs_reply: the SQL approximation of the _needs_reply heuristic.
+    - total_threads: distinct threads (NULL thread_id = own thread).
+    """
+    from zoneinfo import ZoneInfo
+
+    today_ist = datetime.now(ZoneInfo("Asia/Kolkata")).date()
+    with get_db_cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT
+                COALESCE(SUM(CASE WHEN is_unread THEN 1 ELSE 0 END), 0) AS unread,
+                COALESCE(SUM(CASE WHEN DATE(CONVERT_TZ(received_at, '+00:00', '+05:30')) = %s THEN 1 ELSE 0 END), 0) AS today,
+                COALESCE(SUM(CASE WHEN {_urgent_subject_sql()} THEN 1 ELSE 0 END), 0) AS urgent,
+                COALESCE(SUM(CASE WHEN {_NEEDS_REPLY_SQL} THEN 1 ELSE 0 END), 0) AS needs_reply,
+                COUNT(DISTINCT COALESCE(thread_id, message_id)) AS total_threads
+            FROM processed_emails
+            WHERE is_archived = FALSE AND is_trashed = FALSE
+            """,
+            (today_ist, *_URGENT_SUBJECT_LIKES),
+        )
+        row = cur.fetchone() or {}
+    return {
+        "unread": int(row.get("unread") or 0),
+        "today": int(row.get("today") or 0),
+        "urgent": int(row.get("urgent") or 0),
+        "needs_reply": int(row.get("needs_reply") or 0),
+        "total_threads": int(row.get("total_threads") or 0),
+    }
+
+
+# ---- Keyset pagination over threads ----
+
+_VALID_FOLDERS = ("inbox", "starred", "unread", "urgent", "reply", "all")
+_VALID_CATS = (None, "primary", "social", "promotions", "updates", "forums")
+_CAT_LABEL = {
+    "social": "CATEGORY_SOCIAL",
+    "promotions": "CATEGORY_PROMOTIONS",
+    "updates": "CATEGORY_UPDATES",
+    "forums": "CATEGORY_FORUMS",
+}
+
+
+def _encode_cursor(last_id: int, folder: str, cat: Optional[str], q: Optional[str]) -> str:
+    payload = json.dumps({"v": 1, "last_id": int(last_id), "folder": folder, "cat": cat, "q": q or None})
+    return _base64.urlsafe_b64encode(payload.encode("utf-8")).decode("ascii")
+
+
+def _decode_cursor(cursor: str, folder: str, cat: Optional[str], q: Optional[str]) -> int:
+    """Decode a list cursor and validate it belongs to this exact query.
+
+    A cursor from another folder/category/search would silently skip or
+    repeat rows, so a mismatch is a 400, not a best-effort decode.
+    Raises ValueError on any invalid or mismatched cursor.
+    """
+    try:
+        payload = json.loads(_base64.urlsafe_b64decode(cursor.encode("ascii")).decode("utf-8"))
+    except Exception:
+        raise ValueError("Invalid pagination cursor.")
+    if not isinstance(payload, dict) or payload.get("v") != 1:
+        raise ValueError("Invalid pagination cursor.")
+    if payload.get("folder") != folder or payload.get("cat") != cat or (payload.get("q") or None) != (q or None):
+        raise ValueError("Pagination cursor does not match this folder/category/search.")
+    last_id = payload.get("last_id")
+    if not isinstance(last_id, int) or last_id <= 0:
+        raise ValueError("Invalid pagination cursor.")
+    return last_id
+
+
+def list_threads(folder: str = "inbox", cat: Optional[str] = None,
+                 q: Optional[str] = None, limit: int = 30,
+                 cursor: Optional[str] = None) -> tuple[list[dict], Optional[str], bool]:
+    """One row per THREAD: the latest message of each thread, id DESC.
+
+    Keyset pagination (NEVER SQL OFFSET): the cursor is an opaque token
+    holding the last seen row id plus the query it belongs to; each page
+    fetches `limit + 1` rows with `id < last_id`. Returns
+    (rows, next_cursor, has_more). Each row carries the full
+    processed_emails columns plus message_count / unread_count for its
+    thread. Folder/cat/q filters apply to the thread's LATEST message.
+    """
+    folder = (folder or "inbox").lower()
+    if folder not in _VALID_FOLDERS:
+        raise ValueError(f"Unknown folder: {folder}")
+    if cat not in _VALID_CATS:
+        raise ValueError(f"Unknown category: {cat}")
+    limit = max(1, min(100, int(limit or 30)))
+    q = (q or "").strip() or None
+
+    last_id = _decode_cursor(cursor, folder, cat, q) if cursor else None
+
+    # Folder predicate on the latest message of the thread.
+    # Non-inbox folders must never surface trashed threads (and
+    # unread/urgent/reply also exclude archived ones, matching the old
+    # client-side activeMails() filter). Starred keeps archived mail
+    # visible, like Gmail's Starred view.
+    if folder == "inbox":
+        folder_sql = "p.is_archived = FALSE AND p.is_trashed = FALSE"
+    elif folder == "starred":
+        folder_sql = "p.is_starred = TRUE AND p.is_trashed = FALSE"
+    elif folder == "unread":
+        folder_sql = "p.is_unread = TRUE AND p.is_archived = FALSE AND p.is_trashed = FALSE"
+    elif folder == "urgent":
+        folder_sql = _urgent_subject_sql("p") + " AND p.is_archived = FALSE AND p.is_trashed = FALSE"
+    elif folder == "reply":
+        # _NEEDS_REPLY_SQL references is_unread/labels/sender/subject
+        # unaliased; in this query only `p` has those columns, so they
+        # resolve to the thread's latest message.
+        folder_sql = _NEEDS_REPLY_SQL + " AND p.is_archived = FALSE AND p.is_trashed = FALSE"
+    else:  # "all": everything except trashed.
+        folder_sql = "p.is_trashed = FALSE"
+
+    params: list[Any] = []
+    if folder == "urgent":
+        params.extend(_URGENT_SUBJECT_LIKES)
+
+    cat_sql = ""
+    if cat in _CAT_LABEL:
+        cat_sql = " AND p.labels LIKE %s"
+        params.append(f"%{_CAT_LABEL[cat]}%")
+    elif cat == "primary":
+        # Primary = no CATEGORY_* label at all (CATEGORY_PERSONAL also
+        # counts as primary, matching _category_from_labels).
+        # COALESCE: a NULL labels value must count as "no category",
+        # not silently drop the row (NULL NOT LIKE is NULL in MySQL).
+        cat_sql = (
+            " AND COALESCE(p.labels, '') NOT LIKE '%CATEGORY_SOCIAL%'"
+            " AND COALESCE(p.labels, '') NOT LIKE '%CATEGORY_PROMOTIONS%'"
+            " AND COALESCE(p.labels, '') NOT LIKE '%CATEGORY_UPDATES%'"
+            " AND COALESCE(p.labels, '') NOT LIKE '%CATEGORY_FORUMS%'"
+        )
+
+    q_sql = ""
+    if q:
+        pattern = f"%{q}%"
+        q_sql = " AND (p.subject LIKE %s OR p.sender LIKE %s OR p.snippet LIKE %s)"
+        params.extend([pattern, pattern, pattern])
+
+    cursor_sql = ""
+    if last_id is not None:
+        cursor_sql = " AND p.id < %s"
+        params.append(last_id)
+
+    params.append(limit + 1)
+    with get_db_cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT p.*,
+                (SELECT COUNT(*) FROM processed_emails t
+                 WHERE COALESCE(t.thread_id, t.message_id) = COALESCE(p.thread_id, p.message_id)) AS message_count,
+                (SELECT COUNT(*) FROM processed_emails t
+                 WHERE COALESCE(t.thread_id, t.message_id) = COALESCE(p.thread_id, p.message_id)
+                   AND t.is_unread = TRUE) AS unread_count
+            FROM processed_emails p
+            JOIN (
+                SELECT COALESCE(thread_id, message_id) AS tkey, MAX(id) AS max_id
+                FROM processed_emails GROUP BY tkey
+            ) latest ON p.id = latest.max_id
+            WHERE {folder_sql}{cat_sql}{q_sql}{cursor_sql}
+            ORDER BY p.id DESC
+            LIMIT %s
+            """,
+            tuple(params),
+        )
+        rows = cur.fetchall()
+
+    has_more = len(rows) > limit
+    page_rows = rows[:limit]
+    next_cursor = _encode_cursor(page_rows[-1]["id"], folder, cat, q) if has_more and page_rows else None
+    return page_rows, next_cursor, has_more
 
 # ================= Configuration Management =================
 
@@ -680,9 +1041,18 @@ def get_dashboard_summary():
         cur.execute("SELECT COUNT(*) AS count FROM processed_emails")
         lifetime_emails = cur.fetchone()
 
+        # Live inbox counts (SQL aggregates over the mirror; the dashboard
+        # stat boxes read these instead of deriving counts client-side).
+        try:
+            inbox_counts = get_inbox_counts()
+        except Exception as e:
+            logger.warning(f"Could not compute inbox counts: {e}")
+            inbox_counts = None
+
         return {
             "latest": latest,
             "history": history,
             "recent_emails": recent_emails,
-            "lifetime_emails": lifetime_emails.get("count", 0) if lifetime_emails else 0
+            "lifetime_emails": lifetime_emails.get("count", 0) if lifetime_emails else 0,
+            "inbox_counts": inbox_counts
         }

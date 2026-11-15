@@ -21,6 +21,7 @@ from app.database import (
 )
 from app.cache import invalidate_inbox_caches
 from app.services.gmail_service import fetch_recent_emails, send_daily_digest_email
+from app.services.history_sync import run_incremental_sync
 from app.services.llm_provider import (
     compute_dynamic_batches,
     execute_with_failover,
@@ -243,6 +244,17 @@ def _execute_consolidated_pipeline_locked(job_uuid: str, range_config: Optional[
     Runs under the _pipeline_lock single-flight guard.
     """
     logger.info(f"Starting consolidated summary pipeline (Job {job_uuid})...")
+
+    # 0. Best-effort incremental sync FIRST, so the pipeline summarises
+    # from a fresh mirror (new mail, deletes, label changes). This only
+    # advances the History checkpoint on success; any failure is logged
+    # and the pipeline continues with its own Gmail fetch below — the
+    # pipeline's own fetch logic is unchanged.
+    try:
+        _sync_result = run_incremental_sync()
+        logger.info(f"Pre-pipeline incremental sync: status={_sync_result.get('status')} mode={_sync_result.get('mode')}")
+    except Exception as e:
+        logger.warning(f"Pre-pipeline incremental sync failed (continuing with pipeline fetch): {e}")
 
     # 1. Resolve date range configuration
     if not range_config:

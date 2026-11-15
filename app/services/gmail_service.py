@@ -61,6 +61,7 @@ def _extract_email_metadata(msg_id: str, detail: dict) -> dict:
 
     return {
         "id": msg_id,
+        "thread_id": detail.get("threadId"),
         "sender": headers.get("From", "Unknown Sender"),
         "subject": headers.get("Subject", "(No Subject)"),
         "date": date_str,
@@ -225,13 +226,63 @@ def fetch_recent_emails(range_config: Optional[dict] = None, hours: int = 24, ma
                 format='metadata',
                 metadataHeaders=['From', 'Subject', 'Date']
             ).execute()
-            
-            email_items.append(_extract_email_metadata(msg_id, detail))
+
+            item = _extract_email_metadata(msg_id, detail)
+            # threadId from the list response (authoritative, no extra call).
+            item["thread_id"] = msg.get("threadId") or item.get("thread_id")
+            email_items.append(item)
         except Exception as e:
             logger.error(f"Error fetching message {msg_id}: {e}")
             continue
 
     return email_items
+
+def get_message_metadata(message_id: str) -> dict:
+    """Fetch one message's metadata (no body) for the History sync.
+
+    The sync learns a message id from a history record and needs its
+    headers/labels/thread to upsert it — one cheap metadata call, not a
+    full-body fetch.
+    """
+    service = get_gmail_client()
+    detail = service.users().messages().get(
+        userId="me",
+        id=message_id,
+        format="metadata",
+        metadataHeaders=["From", "Subject", "Date"],
+    ).execute()
+    return _extract_email_metadata(message_id, detail)
+
+
+def get_profile_history_id() -> int:
+    """Current Gmail historyId for the account (users.getProfile).
+
+    This is the checkpoint value a fresh or reconciled sync anchors to.
+    """
+    service = get_gmail_client()
+    profile = service.users().getProfile(userId="me").execute()
+    return int(profile.get("historyId"))
+
+
+def list_history(start_history_id: int, page_token: Optional[str] = None) -> dict:
+    """One page of Gmail History records from startHistoryId.
+
+    historyTypes cover adds, deletes and label changes; maxResults is
+    capped at 100 per page by the caller (history_sync caps the run at
+    5 pages). Raises googleapiclient HttpError — callers translate a
+    404/410 into a controlled reconciliation.
+    """
+    service = get_gmail_client()
+    kwargs: dict = {
+        "userId": "me",
+        "startHistoryId": str(start_history_id),
+        "maxResults": 100,
+        "historyTypes": ["messageAdded", "messageDeleted", "labelAdded", "labelRemoved"],
+    }
+    if page_token:
+        kwargs["pageToken"] = page_token
+    return service.users().history().list(**kwargs).execute()
+
 
 def update_gmail_message_state(message_id: str, is_unread: Optional[bool] = None, is_starred: Optional[bool] = None, is_trash: Optional[bool] = None, is_archived: Optional[bool] = None, is_spam: Optional[bool] = None) -> bool:
     """
@@ -490,17 +541,24 @@ def send_email(to_address: str, subject: str, body_text: str) -> Optional[str]:
     return sent.get("id")
 
 
-def reply_to_email(message_id: str, body_text: str) -> Optional[str]:
+def reply_to_email(message_id: str, body_text: str, reply_all: bool = False) -> Optional[str]:
     """Reply in-thread to a Gmail message via the Gmail API.
 
     Fetches the original (thread id, sender, subject), then sends with
     the same ``threadId`` so Gmail threads the reply correctly, with a
-    ``Re:`` subject when the original has none. Returns the sent id.
+    ``Re:`` subject when the original has none, and In-Reply-To /
+    References preserved so other clients thread it too.
+
+    reply_all: the reply also goes to the other participants — To is
+    the original sender plus the original To recipients, Cc is the
+    original Cc recipients (each minus the user's own address and
+    duplicates). With reply_all=False the reply goes only to the sender.
+    Returns the sent id.
     """
     service = get_gmail_client()
     original = service.users().messages().get(
         userId="me", id=message_id, format="metadata",
-        metadataHeaders=["From", "Subject", "Message-ID"],
+        metadataHeaders=["From", "To", "Cc", "Subject", "Message-ID", "References"],
     ).execute()
     headers = {h["name"]: h["value"] for h in original.get("payload", {}).get("headers", [])}
     _name, sender_email = parseaddr(headers.get("From", ""))
@@ -510,18 +568,48 @@ def reply_to_email(message_id: str, body_text: str) -> Optional[str]:
     if not subject.lower().startswith("re:"):
         subject = f"Re: {subject}" if subject else "Re: (no subject)"
 
+    def _addrs(header_value: str) -> list[str]:
+        """Split a To/Cc header into individual email addresses."""
+        addrs: list[str] = []
+        for part in (header_value or "").split(","):
+            _n, addr = parseaddr(part.strip())
+            if addr:
+                addrs.append(addr)
+        return addrs
+
+    my_email = (settings.MY_EMAIL or "").strip().lower()
+    recipients = [sender_email]
+    cc_list: list[str] = []
+    if reply_all:
+        seen = {sender_email.lower()}
+        if my_email:
+            seen.add(my_email)
+        for addr in _addrs(headers.get("To", "")):
+            if addr.lower() not in seen:
+                seen.add(addr.lower())
+                recipients.append(addr)
+        for addr in _addrs(headers.get("Cc", "")):
+            if addr.lower() not in seen:
+                seen.add(addr.lower())
+                cc_list.append(addr)
+
     msg = EmailMessage()
     msg["Subject"] = subject
     msg["From"] = "me"
-    msg["To"] = sender_email
+    msg["To"] = ", ".join(recipients)
+    if cc_list:
+        msg["Cc"] = ", ".join(cc_list)
     if headers.get("Message-ID"):
         msg["In-Reply-To"] = headers["Message-ID"]
-        msg["References"] = headers["Message-ID"]
+        # Preserve the original References chain, appending this
+        # message's id so the thread stays linked downstream.
+        orig_refs = (headers.get("References") or "").strip()
+        msg["References"] = f"{orig_refs} {headers['Message-ID']}".strip()
     msg.set_content(body_text)
     raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
     sent = service.users().messages().send(
         userId="me",
         body={"raw": raw, "threadId": original.get("threadId")},
     ).execute()
-    logger.info(f"Sent reply to {sender_email} in thread {original.get('threadId')} (id={sent.get('id')})")
+    logger.info(f"Sent reply to {sender_email} in thread {original.get('threadId')} (id={sent.get('id')}, reply_all={reply_all})")
     return sent.get("id")

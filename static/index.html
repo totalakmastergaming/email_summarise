@@ -204,8 +204,8 @@
                 </div>
               </div>
               <div class="gm-range"><span id="gmRange"></span>
-                <button class="gm-tbtn" disabled aria-label="Newer"><svg viewBox="0 0 24 24"><path d="M15.41 7.41 14 6l-6 6 6 6 1.41-1.41L10.83 12z"/></svg></button>
-                <button class="gm-tbtn" disabled aria-label="Older"><svg viewBox="0 0 24 24"><path d="M10 6 8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z"/></svg></button>
+                <button class="gm-tbtn" id="gmNewer" aria-label="Newer"><svg viewBox="0 0 24 24"><path d="M15.41 7.41 14 6l-6 6 6 6 1.41-1.41L10.83 12z"/></svg></button>
+                <button class="gm-tbtn" id="gmOlder" aria-label="Older"><svg viewBox="0 0 24 24"><path d="M10 6 8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z"/></svg></button>
               </div>
             </div>
             <div class="gm-toolbar" id="gmBarSel" hidden>
@@ -532,7 +532,7 @@
     <input id="cSubject" type="text" placeholder="Subject" autocomplete="off" aria-label="Subject" />
     <textarea id="cBody" placeholder="Write your message…" aria-label="Message"></textarea>
     <div style="display:flex;gap:8px;flex-wrap:wrap">
-      <button class="btn primary" type="submit">Open in mail app</button>
+      <button class="btn primary" type="submit">Send</button>
       <button class="btn" type="button" id="copyDraft">Copy draft</button>
     </div>
   </form>
