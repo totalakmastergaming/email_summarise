@@ -290,7 +290,8 @@ _NO_REPLY_SUBJECT_TOKENS = (
 )
 
 
-def _needs_reply(is_unread: bool, category: str, sender: str, subject: str) -> bool:
+def _needs_reply(is_unread: bool, category: str, sender: str, subject: str,
+                 sender_email: Optional[str] = None) -> bool:
     """Heuristic 'needs a reply' flag — NOT just `= urgent` any more.
 
     A mail plausibly needs a reply when it is unread, in Primary, from a
@@ -298,8 +299,18 @@ def _needs_reply(is_unread: bool, category: str, sender: str, subject: str) -> b
     and its subject does not read as automated mail. This is a heuristic:
     true reply detection (does the thread already contain a reply sent
     by the user?) needs thread history and is an open item — see NOTES.
+
+    HOTFIX 2026-11-16 (round 2): the user's own mail never needs a
+    reply from the user. Self-sent threads (sender "Navneet Yadav
+    <navneetyadav.me@gmail.com>") used to be flagged, so the brief
+    listed the user's own name under awaiting reply. ``sender_email``
+    is the parsed address part of the sender; it is compared against
+    settings.MY_EMAIL.
     """
     if not is_unread or category != "primary":
+        return False
+    own = (settings.MY_EMAIL or "").strip().lower()
+    if own and (sender_email or "").strip().lower() == own:
         return False
     sender_lower = (sender or "").lower()
     if any(tok in sender_lower for tok in _AUTOMATED_SENDER_TOKENS):
@@ -437,7 +448,7 @@ def _mail_obj_from_row(r: dict) -> dict:
         "starred": is_sta,
         "archived": bool(r.get("is_archived", False)),
         "trashed": bool(r.get("is_trashed", False)),
-        "needsReply": _needs_reply(is_unr, category, sender_str, subject_text),
+        "needsReply": _needs_reply(is_unr, category, sender_str, subject_text, email_part),
         "tag": "Alert" if is_urgent else "Inbound",
         "cat": category,
         "labels": r.get("labels", "")

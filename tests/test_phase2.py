@@ -722,14 +722,27 @@ def _draft_db_row(**over):
 
 class TestDraftsDB:
     def test_create_draft_sql_and_shape(self, monkeypatch):
-        fake = FakeCursor(fetchone_row=_draft_db_row())
+        # HOTFIX 2026-11-16 (round 2): the dedup SELECT now runs FIRST
+        # on the same cursor and finds nothing (fetchone -> None), so
+        # the INSERT follows; there is no re-read afterwards.
+        fake = FakeCursor(fetchone_row=[None])
         monkeypatch.setattr(db, "get_db_cursor", fake_cursor_ctx(fake))
         draft = db.create_draft(["a@b.com"], [], [], "Hi", "Body")
-        assert "INSERT INTO drafts" in fake.executed[0][0]
-        assert "SELECT * FROM drafts WHERE id = %s" in fake.executed[1][0]
-        assert draft["id"] == 7 and draft["to"] == ["a@b.com"]
+        assert len(fake.executed) == 2
+        dedup_sql, dedup_params = fake.executed[0]
+        assert "SELECT id, to_addrs" in dedup_sql and "FROM drafts" in dedup_sql
+        assert "DATE_SUB(NOW(), INTERVAL %s MINUTE)" in dedup_sql
+        assert dedup_params == ("a@b.com", "", "", "Hi", "Body", None, None,
+                                db._DRAFT_DEDUP_WINDOW_MINUTES)
+        assert "INSERT INTO drafts" in fake.executed[1][0]
+        assert fake.executed[1][1] == ("a@b.com", "", "", "Hi", "Body",
+                                        None, None)
+        # No re-read: the returned dict is built from the inserted
+        # values (id from lastrowid, timestamps from insert time).
+        assert draft["id"] == 99  # FakeCursor.lastrowid
+        assert draft["to"] == ["a@b.com"]
         assert draft["subject"] == "Hi" and draft["body"] == "Body"
-        assert draft["created_at"] == "2026-11-16T08:00:00"
+        assert draft["created_at"] and draft["created_at"] == draft["updated_at"]
 
     def test_get_draft_none_when_missing(self, monkeypatch):
         fake = FakeCursor(fetchone_row=None)
@@ -759,10 +772,15 @@ class TestDraftsDB:
         updated = db.update_draft(7, {"subject": "New", "bogus_col": 1,
                                       "to": ["x@y.com"]})
         assert updated["subject"] == "New"
-        update_sql = fake.executed[0][0]
+        # HOTFIX 2026-11-16 (round 2): the row is read FIRST on the
+        # same cursor, then updated; there is no re-read afterwards.
+        assert len(fake.executed) == 2
+        assert "SELECT * FROM drafts WHERE id = %s" in fake.executed[0][0]
+        update_sql = fake.executed[1][0]
         assert "UPDATE drafts SET" in update_sql
         assert "bogus_col" not in update_sql
         assert "to_addrs = %s" in update_sql
+        assert "subject = %s" in update_sql
 
     def test_update_draft_no_valid_fields_just_reads(self, monkeypatch):
         fake = FakeCursor(fetchone_row=_draft_db_row())

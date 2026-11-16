@@ -43,6 +43,23 @@ var forwardSkipped = [];
 var currentDraftId = null;
 var draftTimer = null;
 var draftSaveState = "idle"; /* idle | saving | saved | error */
+/* HOTFIX 2026-11-16 (round 2): a create can commit server-side while
+   its response is lost, so the UI must not treat "no id returned" as
+   "no draft exists" — pendingDraftPayload remembers the payload of a
+   failed create so the next save can adopt that row instead of
+   POSTing a duplicate. draftSession is bumped on every fresh compose
+   / reopened draft so a save that resolves after the compose was
+   replaced never writes its id or status into the new session.
+   draftSavePending remembers input that arrived mid-save so it gets
+   its own save instead of being dropped by the in-flight guard. */
+var draftSession = 0;
+var draftSavePending = false;
+var pendingDraftPayload = null;
+/* Account email from /api/dashboard config (MY_EMAIL), lowercased.
+   The dashboard returns no display name for the account, so sender
+   email — not sender name — is how the UI recognises the user's own
+   mail (e.g. to keep self-sent threads out of "awaiting a reply"). */
+var USER_EMAIL = "";
 /* Current open thread (GET /api/threads/{id}) and its load state. */
 var THREAD = null;
 var THREAD_LOADING = false;
@@ -263,10 +280,19 @@ function renderStats(){
   renderFolderBadges();
   $("#statUnreadSub").innerHTML = c.unread>0 ? "Across "+totalThreads+" conversations in your inbox" : "Inbox zero — nothing unread";
   $("#statTodaySub").innerHTML = "Since 12:00 AM today · <b>"+pool.filter(function(m){return m.today&&m.unread;}).length+" still unread</b>";
+  /* HOTFIX 2026-11-16 (round 2): the counts above are server-wide
+     (all inbox categories) while the pool is only Primary page 1, so
+     a subtext drawn from the pool alone contradicts its own card
+     whenever the urgent / waiting threads sit in another tab or on a
+     later page. Fall back to the server count instead of claiming
+     "nothing" when the pool is silent. The reply name also skips the
+     user's own mail (sender email == MY_EMAIL, see USER_EMAIL). */
   var firstUrgent = pool.filter(function(m){return m.urgent;})[0];
-  var firstReply = pool.filter(function(m){return m.needsReply;})[0];
-  $("#statUrgentSub").innerHTML = firstUrgent ? "Priority: <b>"+escapeHtml(firstUrgent.subject)+"</b>" : "Nothing marked urgent";
-  $("#statReplySub").innerHTML = firstReply ? "Waiting from: <b>"+escapeHtml(firstReply.sender)+"</b>" : "No one is waiting on you";
+  var firstReply = pool.filter(function(m){return m.needsReply && (!USER_EMAIL || String(m.email || "").toLowerCase() !== USER_EMAIL);})[0];
+  $("#statUrgentSub").innerHTML = firstUrgent ? "Priority: <b>"+escapeHtml(firstUrgent.subject)+"</b>"
+    : (c.urgent > 0 ? c.urgent + " urgent mail" + (c.urgent > 1 ? "s" : "") + " in your inbox — open Urgent to see them" : "Nothing marked urgent");
+  $("#statReplySub").innerHTML = firstReply ? "Waiting from: <b>"+escapeHtml(firstReply.sender)+"</b>"
+    : (c.reply > 0 ? c.reply + " thread" + (c.reply > 1 ? "s" : "") + " waiting — open Awaiting reply to see them" : "No one is waiting on you");
   /* AI brief: when initBackend painted the latest briefing report
      into #aiBriefText, keep it — the counts sentence below is the
      fallback for when no briefing exists. Previously renderStats
@@ -282,8 +308,18 @@ function renderStats(){
     pool.filter(function(m){return m.urgent;}).slice(0,3).forEach(function(m){
       pts.push("<li><span class='dot'></span><span><b>"+escapeHtml(m.sender)+":</b> "+escapeHtml((m.summary||"").split(".")[0])+".</span></li>");
     });
-    var extra = pool.filter(function(m){return m.needsReply && !m.urgent;});
-    if(extra.length) pts.push("<li><span class='dot'></span><span>Also awaiting a reply: <b>"+extra.map(function(m){return escapeHtml(m.sender);}).join(", ")+"</b>.</span></li>");
+    /* HOTFIX 2026-11-16 (round 2): one entry per person, never the
+       user's own name three times. Threads whose latest message is
+       from the user are flagged needsReply by the server heuristic,
+       but they are not waiting on the user — drop them by sender
+       email (the dashboard returns no account display name, only
+       config.recipient_email). When nobody else is waiting the line
+       is omitted; the count sentence above still states the total. */
+    var extra = pool.filter(function(m){return m.needsReply && !m.urgent;})
+      .filter(function(m){ return !USER_EMAIL || String(m.email || "").toLowerCase() !== USER_EMAIL; });
+    var extraNames = [];
+    extra.forEach(function(m){ var n = m.sender || ""; if(n && extraNames.indexOf(n) === -1) extraNames.push(n); });
+    if(extraNames.length) pts.push("<li><span class='dot'></span><span>Also awaiting a reply: <b>"+extraNames.map(function(n){return escapeHtml(n);}).join(", ")+"</b>.</span></li>");
     $("#aiBriefPoints").innerHTML = pts.join("");
   }
 }
@@ -431,7 +467,16 @@ function renderGmailChrome(){
 function renderLists(){
   var pool = dashPool();
   var urgent = pool.filter(function(m){return m.urgent;});
-  $("#urgentList").innerHTML = urgent.length ? urgent.map(miniRowHtml).join("") : '<div class="empty">Nothing urgent right now.</div>';
+  /* HOTFIX 2026-11-16 (round 2): same pool-vs-count split as the
+     Urgent card subtext — the pool is Primary page 1, the count is
+     inbox-wide. When the pool holds no urgent thread but the server
+     count says there are some, say so instead of "Nothing urgent
+     right now"; the panel's View all button opens the Urgent filter. */
+  var urgentCount = INBOX_COUNTS ? (INBOX_COUNTS.urgent || 0) : 0;
+  $("#urgentList").innerHTML = urgent.length ? urgent.map(miniRowHtml).join("")
+    : (urgentCount > 0
+      ? '<div class="empty">' + urgentCount + ' urgent mail' + (urgentCount > 1 ? 's' : '') + ' in your inbox — use View all above to open the Urgent filter.</div>'
+      : '<div class="empty">Nothing urgent right now.</div>');
   $("#recentList").innerHTML = pool.slice(0,5).map(mailRowHtml).join("");
   var list = filteredMails();
   var folderEmpty = {
@@ -1496,6 +1541,11 @@ function clearComposeFields(){
   var ae=$("#cAttachError"); if(ae) ae.hidden = true;
 }
 function startFreshCompose(){
+  /* New session: a save from the previous compose that resolves late
+     must not write its id/status into this one (see saveDraft). */
+  draftSession++;
+  pendingDraftPayload = null;
+  draftSavePending = false;
   currentDraftId = null;
   composeAttachments = [];
   forwardSkipped = [];
@@ -1610,8 +1660,56 @@ function deleteDraft(id){
   if(id == null) return Promise.resolve(false);
   return apiFetch("/api/drafts/" + encodeURIComponent(id), { method: "DELETE" }).then(function(res){ return res.ok; }).catch(function(){ return false; });
 }
+/* HOTFIX 2026-11-16 (round 2): a failed create may still have left
+   a row behind. create_draft() commits the INSERT, then re-reads the
+   row with get_draft(); when that re-read (or the response) fails the
+   endpoint 500s but the row persists — live, three identical drafts
+   at 02:59/02:59/03:00, one per save attempt, each reported as a
+   failure because the UI never learned the id. Before POSTing a
+   fresh draft, look for the newest server draft whose content
+   exactly matches the attempted payload and was created minutes
+   ago; adopting it turns the retry into an update instead of a
+   duplicate. Returns the draft id, or null. */
+function sameDraftPayload(dr, payload){
+  var addr = function(v){ return parseAddressList(v).join(","); };
+  return addr(dr.to) === addr(payload.to)
+    && addr(dr.cc) === addr(payload.cc)
+    && addr(dr.bcc) === addr(payload.bcc)
+    && (dr.subject || "") === (payload.subject || "")
+    && (dr.body || "") === (payload.body || "");
+}
+async function reconcileDraft(payload){
+  try {
+    var res = await apiFetch("/api/drafts?limit=10");
+    if(!res.ok) return null;
+    var d = await res.json().catch(function(){ return {}; });
+    var list = Array.isArray(d) ? d : (Array.isArray(d.drafts) ? d.drafts : []);
+    var now = Date.now();
+    for(var i = 0; i < list.length; i++){
+      var dr = list[i];
+      if(!dr || dr.id == null) continue;
+      if(!sameDraftPayload(dr, payload)) continue;
+      /* Only a recent row can be this session's lost create — an
+         older draft with identical text is the user's own, not ours
+         to adopt. NOTE: the API returns naive-UTC timestamps
+         ("2026-11-16T03:11:14"); Date.parse would read one as local
+         time, so in IST every draft would look ~5.5 h old and the
+         10-minute window would never match. Append "Z" when the
+         string carries no timezone designator. */
+      var ts = dr.created_at || dr.updated_at || "";
+      var created = ts ? Date.parse(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?$/.test(ts) ? ts + "Z" : ts) : NaN;
+      if(created && (now - created > 10 * 60 * 1000)) continue;
+      return dr.id;
+    }
+  } catch(e){ /* Drafts list unreachable: caller falls back to POST. */ }
+  return null;
+}
 async function saveDraft(){
-  if(draftSaveState === "saving") return false;
+  var mySession = draftSession;
+  /* A save already in flight covers the content typed before it
+     started; remember the newer input so it gets its own save when
+     this one lands instead of being silently dropped. */
+  if(draftSaveState === "saving"){ draftSavePending = true; return false; }
   /* An empty compose never creates a draft; closing one deletes the
      server draft instead of leaving an empty row in Drafts. */
   if(composeIsEmpty()){
@@ -1620,31 +1718,73 @@ async function saveDraft(){
       currentDraftId = null;
       await deleteDraft(oldId);
     }
-    setDraftStatus("idle");
+    if(mySession === draftSession) setDraftStatus("idle");
     return true;
   }
   setDraftStatus("saving");
+  var payload = composeDraftPayload();
+  draftSavePending = false;
   try {
-    var payload = composeDraftPayload();
+    /* A previous create may have committed while its response was
+       lost — adopt the row it left behind before POSTing a fresh
+       one (see reconcileDraft). */
+    if(currentDraftId == null && pendingDraftPayload){
+      var adopted = await reconcileDraft(pendingDraftPayload);
+      pendingDraftPayload = null;
+      if(adopted != null) currentDraftId = adopted;
+    }
     var res, d;
     if(currentDraftId != null){
       res = await apiFetch("/api/drafts/" + encodeURIComponent(currentDraftId), { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
       d = await res.json().catch(function(){ return {}; });
-    } else {
+      if(res.status === 404){
+        /* Draft deleted elsewhere (another tab, the Drafts folder) —
+           the stored id is dead; create a fresh draft instead of
+           failing every retry against a dead id. */
+        currentDraftId = null;
+        res = null;
+      }
+    }
+    if(currentDraftId == null){
       res = await apiFetch("/api/drafts", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
       d = await res.json().catch(function(){ return {}; });
       if(res.ok){
         var nid = (d.draft && d.draft.id != null) ? d.draft.id : (d.id != null ? d.id : d.draft_id);
         if(nid != null) currentDraftId = nid;
+      } else {
+        /* The create failed, but it may have committed before the
+           response was lost — remember the attempted payload and
+           try adopting the row now, so this attempt still ends in
+           "Draft saved" instead of a duplicate on the next retry. */
+        pendingDraftPayload = payload;
+        var adoptedNow = await reconcileDraft(payload);
+        if(adoptedNow != null){
+          currentDraftId = adoptedNow;
+          pendingDraftPayload = null;
+          res = await apiFetch("/api/drafts/" + encodeURIComponent(currentDraftId), { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+          d = await res.json().catch(function(){ return {}; });
+        }
       }
     }
-    if(!res.ok) throw new Error((d && d.detail) || "save failed");
+    /* The compose was replaced (closed/reopened) while this save was
+       in flight: never write its id or status into the new session. */
+    if(mySession !== draftSession) return false;
+    if(!res || !res.ok) throw new Error((d && d.detail) || "save failed");
     setDraftStatus("saved");
-    renderFolderBadges();
     return true;
   } catch(e){
-    setDraftStatus("error");
+    if(mySession === draftSession) setDraftStatus("error");
     return false;
+  } finally {
+    /* Badge painting must never masquerade as a save failure: it
+       used to run inside the try, after the status was set, so a
+       throw there flipped a successful save to "Couldn't save draft
+       — retry". It only repaints from the last dashboard counts. */
+    try { renderFolderBadges(); } catch(be){}
+    if(mySession === draftSession && draftSavePending){
+      draftSavePending = false;
+      scheduleDraftAutosave();
+    }
   }
 }
 function scheduleDraftAutosave(){
@@ -2100,6 +2240,7 @@ async function initBackend(){
         if(mt) mt.textContent = cfg.model;
       }
       if(cfg.recipient_email){
+        USER_EMAIL = String(cfg.recipient_email).toLowerCase();
         var em = $("#userEmail");
         if(em) em.textContent = cfg.recipient_email;
         var un = $("#userName");

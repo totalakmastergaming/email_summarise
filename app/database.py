@@ -497,18 +497,40 @@ _NEEDS_REPLY_PATTERNS = [
 ]
 
 
-def _needs_reply_sql(alias: str = "p") -> tuple[str, list[str]]:
+def _like_escape(value: str) -> str:
+    """Escape ``%``, ``_`` and ``\\`` for a LIKE pattern (MySQL uses
+    backslash escapes)."""
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _needs_reply_sql(alias: str = "p", exclude_sender_email: Optional[str] = None) -> tuple[str, list[str]]:
     """(SQL, params) for the needs-reply heuristic on one row.
 
     Columns are qualified with ``alias`` (the latest-message alias in
     every caller); patterns are bound params, never inlined.
+
+    HOTFIX 2026-11-16 (round 2): the user's own mail is excluded. A
+    self-sent thread (sender "Navneet Yadav
+    <navneetyadav.me@gmail.com>", unread, Primary) used to count as
+    awaiting a reply FROM the user — live, the brief listed "Navneet
+    Yadav" three times under awaiting reply, and the needs_reply count
+    included those threads. ``exclude_sender_email`` defaults to
+    settings.MY_EMAIL; pass "" to disable the exclusion.
     """
     a = f"{alias}." if alias else ""
     parts = [f"{a}is_unread = TRUE"]
     parts.extend(
         f"COALESCE({a}{col}, '') NOT LIKE %s" for col, _ in _NEEDS_REPLY_PATTERNS
     )
-    return "(" + " AND ".join(parts) + ")", [pat for _, pat in _NEEDS_REPLY_PATTERNS]
+    params = [pat for _, pat in _NEEDS_REPLY_PATTERNS]
+    own = (exclude_sender_email if exclude_sender_email is not None
+           else (settings.MY_EMAIL or "").strip())
+    if own:
+        # sender is stored as "Name <email>" (or a bare address): the
+        # account address appearing anywhere in it means own mail.
+        parts.append(f"COALESCE({a}sender, '') NOT LIKE %s")
+        params.append(f"%{_like_escape(own)}%")
+    return "(" + " AND ".join(parts) + ")", params
 
 
 def _urgent_subject_sql(alias: str = "") -> str:
@@ -1042,24 +1064,83 @@ def _draft_row_to_dict(row: Optional[dict]) -> Optional[dict]:
     }
 
 
+# How long a just-created identical draft counts as "the same autosave
+# retry" (see create_draft). The UI adopts a lost create the same way
+# (reconcileDraft, 10-minute window) — keep the two windows identical.
+_DRAFT_DEDUP_WINDOW_MINUTES = 10
+
+
 def create_draft(to_addrs: list[str], cc_addrs: list[str], bcc_addrs: list[str],
                  subject: str, body: str,
                  thread_id: Optional[str] = None,
                  message_id: Optional[str] = None) -> dict:
-    """Insert a server draft; returns the created draft dict."""
+    """Insert a server draft; returns the created draft dict.
+
+    HOTFIX 2026-11-16 (round 2): this used to INSERT on one pooled
+    connection and then re-read the row with get_draft() on a second
+    one. When that second step failed (cold TiDB / pool contention),
+    the endpoint 500d AFTER the row had committed, so the UI never
+    learned the id and every retry POSTed another identical row —
+    live, three copies at 02:59/02:59/03:00. The whole create now runs
+    on ONE cursor: a dedup lookup, the INSERT, and the returned dict
+    built from the inserted values (no re-read).
+
+    Idempotency: a POST whose response was lost leaves a row behind;
+    a retry POSTing byte-identical content (same to/cc/bcc/subject/
+    body/thread/message) within _DRAFT_DEDUP_WINDOW_MINUTES returns
+    that existing row instead of inserting a duplicate. Two genuinely
+    distinct drafts can only collide if the user composes byte-identical
+    content twice within the window — the second compose then adopts
+    the first row (same text, one Drafts entry).
+    """
+    to_s = ",".join(to_addrs or [])
+    cc_s = ",".join(cc_addrs or [])
+    bcc_s = ",".join(bcc_addrs or [])
+    subject = subject or ""
+    body = body or ""
+    now_iso = _utcnow_naive().isoformat()
     with get_db_cursor(commit=True) as cur:
+        # Retry of a create whose response was lost? Adopt the row it
+        # left behind instead of inserting a duplicate.
+        cur.execute(
+            """
+            SELECT id, to_addrs, cc_addrs, bcc_addrs, subject, body,
+                   thread_id, message_id, created_at, updated_at
+            FROM drafts
+            WHERE to_addrs <=> %s AND cc_addrs <=> %s AND bcc_addrs <=> %s
+              AND subject <=> %s AND body <=> %s
+              AND thread_id <=> %s AND message_id <=> %s
+              AND created_at >= DATE_SUB(NOW(), INTERVAL %s MINUTE)
+            ORDER BY id DESC LIMIT 1
+            """,
+            (to_s, cc_s, bcc_s, subject, body, thread_id, message_id,
+             _DRAFT_DEDUP_WINDOW_MINUTES),
+        )
+        existing = _draft_row_to_dict(cur.fetchone())
+        if existing is not None:
+            return existing
         cur.execute(
             """
             INSERT INTO drafts (to_addrs, cc_addrs, bcc_addrs, subject, body, thread_id, message_id)
             VALUES (%s, %s, %s, %s, %s, %s, %s)
             """,
-            (",".join(to_addrs), ",".join(cc_addrs), ",".join(bcc_addrs),
-             subject or "", body or "", thread_id, message_id),
+            (to_s, cc_s, bcc_s, subject, body, thread_id, message_id),
         )
         draft_id = cur.lastrowid
-    draft = get_draft(draft_id)
-    assert draft is not None
-    return draft
+    # No re-read: the row's timestamps are the DB CURRENT_TIMESTAMP
+    # defaults, i.e. this insert time to the second.
+    return {
+        "id": draft_id,
+        "to": list(to_addrs or []),
+        "cc": list(cc_addrs or []),
+        "bcc": list(bcc_addrs or []),
+        "subject": subject,
+        "body": body,
+        "thread_id": thread_id,
+        "message_id": message_id,
+        "created_at": now_iso,
+        "updated_at": now_iso,
+    }
 
 
 def get_draft(draft_id: int) -> Optional[dict]:
@@ -1099,25 +1180,48 @@ def list_drafts(limit: int = 30, cursor: Optional[str] = None) -> tuple[list[dic
 def update_draft(draft_id: int, updates: dict) -> Optional[dict]:
     """Partial update of a draft; returns the updated draft, or None
     when the id does not exist. Only whitelisted columns are written;
-    ``to``/``cc``/``bcc`` accept address lists (stored comma-joined)."""
+    ``to``/``cc``/``bcc`` accept address lists (stored comma-joined).
+
+    HOTFIX 2026-11-16 (round 2): same two-acquisition shape as the old
+    create_draft (UPDATE on one connection, re-read with get_draft()
+    on a second) — a failure in the re-read 500d after the UPDATE had
+    committed. The row is now read FIRST on the same cursor, the
+    UPDATE applied, and the merged dict returned with no re-read.
+    """
     allowed = {"to_addrs", "cc_addrs", "bcc_addrs", "subject", "body", "thread_id", "message_id"}
     clauses: list[str] = []
     params: list[Any] = []
+    # Public-shape values for the merged return dict.
+    merged_updates: dict = {}
     for key, value in (updates or {}).items():
+        public_key = key
         if key in ("to", "cc", "bcc"):
             key = f"{key}_addrs"
-            value = ",".join(value) if isinstance(value, (list, tuple)) else str(value or "")
+            stored = ",".join(value) if isinstance(value, (list, tuple)) else str(value or "")
+            public_value: Any = (list(value) if isinstance(value, (list, tuple))
+                                 else [p.strip() for p in str(value or "").split(",") if p.strip()])
+        else:
+            stored = value
+            public_value = value
         if key in allowed:
             clauses.append(f"{key} = %s")
-            params.append(value)
-    if not clauses:
-        return get_draft(draft_id)
-    params.append(int(draft_id))
+            params.append(stored)
+            merged_updates[public_key] = public_value
     with get_db_cursor(commit=True) as cur:
-        cur.execute(f"UPDATE drafts SET {', '.join(clauses)} WHERE id = %s", tuple(params))
-        if cur.rowcount == 0:
+        cur.execute("SELECT * FROM drafts WHERE id = %s", (int(draft_id),))
+        current = _draft_row_to_dict(cur.fetchone())
+        if current is None:
             return None
-    return get_draft(draft_id)
+        if not clauses:
+            return current
+        params.append(int(draft_id))
+        cur.execute(f"UPDATE drafts SET {', '.join(clauses)} WHERE id = %s", tuple(params))
+    merged = dict(current)
+    merged.update(merged_updates)
+    # The DB sets updated_at = CURRENT_TIMESTAMP ON UPDATE — this
+    # insert-time value is the same second in practice.
+    merged["updated_at"] = _utcnow_naive().isoformat()
+    return merged
 
 
 def delete_draft(draft_id: int) -> bool:
