@@ -197,6 +197,29 @@ def init_db() -> bool:
                 );
             """)
 
+            # 1c. Server-side compose/reply drafts (Phase 2). Drafts live
+            # in TiDB — not localStorage — so they survive refresh, work
+            # across devices, and can be listed in the Drafts folder and
+            # sent from the server. to/cc/bcc are comma-separated address
+            # lists (TEXT: a draft may hold up to 20 recipients).
+            # thread_id/message_id are set for reply drafts (the draft
+            # replies in-thread when sent); NULL for fresh composes.
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS drafts (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    to_addrs TEXT NULL,
+                    cc_addrs TEXT NULL,
+                    bcc_addrs TEXT NULL,
+                    subject VARCHAR(500) NULL,
+                    body LONGTEXT NULL,
+                    thread_id VARCHAR(255) NULL,
+                    message_id VARCHAR(255) NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    INDEX idx_draft_thread_id (thread_id)
+                );
+            """)
+
             # 2. Daily executive digest reports archive
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS daily_reports (
@@ -330,13 +353,24 @@ def get_unprocessed_message_ids(candidate_ids: list[str]) -> set[str]:
         return set(candidate_ids) - existing_ids
 
 def save_processed_emails(emails_data: list[dict]):
-    """Insert or update processed emails into TiDB with live read/starred states."""
+    """Insert or update processed emails into TiDB with live read/starred states.
+
+    The stored ``labels`` CSV is the source of truth for folder state,
+    so the ``is_archived`` / ``is_trashed`` mirror flags are derived
+    from it here — on INSERT and on duplicate-key UPDATE — exactly as
+    ``apply_label_delta`` / the label sync derive them (archived =
+    INBOX absent, trashed = TRASH present). Previously the INSERT
+    omitted both flags (defaulting FALSE) and the UPDATE never touched
+    them, so any row that arrived without INBOX (e.g. Sent mail, which
+    the date-range Gmail fetch pulls in) was stored as "in inbox" and
+    counted in the dashboard while belonging to no inbox tab.
+    """
     if not emails_data:
         return
     with get_db_cursor(commit=True) as cur:
         sql = """
-            INSERT INTO processed_emails (message_id, thread_id, sender, subject, snippet, is_unread, is_starred, labels, received_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            INSERT INTO processed_emails (message_id, thread_id, sender, subject, snippet, is_unread, is_starred, labels, is_archived, is_trashed, received_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON DUPLICATE KEY UPDATE
                 thread_id = VALUES(thread_id),
                 sender = VALUES(sender),
@@ -344,7 +378,9 @@ def save_processed_emails(emails_data: list[dict]):
                 snippet = VALUES(snippet),
                 is_unread = VALUES(is_unread),
                 is_starred = VALUES(is_starred),
-                labels = VALUES(labels)
+                labels = VALUES(labels),
+                is_archived = VALUES(is_archived),
+                is_trashed = VALUES(is_trashed)
         """
         values = []
         for e in emails_data:
@@ -355,6 +391,7 @@ def save_processed_emails(emails_data: list[dict]):
                 except Exception:
                     rec_at = None
             labels_str = ",".join(e.get("label_ids", [])) if isinstance(e.get("label_ids"), list) else e.get("labels", "")
+            label_set = {p.strip() for p in str(labels_str or "").split(",") if p.strip()}
             values.append((
                 e["id"],
                 e.get("thread_id"),
@@ -364,6 +401,8 @@ def save_processed_emails(emails_data: list[dict]):
                 bool(e.get("is_unread", True)),
                 bool(e.get("is_starred", False)),
                 labels_str,
+                "INBOX" not in label_set,
+                "TRASH" in label_set,
                 rec_at
             ))
         cur.executemany(sql, values)
@@ -566,19 +605,86 @@ def set_sync_checkpoint(history_id: int, mode: str) -> None:
         )
 
 
-def get_inbox_counts() -> dict:
-    """SQL counts for the dashboard, all over non-archived/non-trashed rows.
+# ---- Folder predicates (Phase 2) ----
+# Single source of truth: the stored Gmail ``labels`` CSV on the
+# thread's LATEST message — NOT the is_archived / is_trashed flags,
+# which the pipeline insert path never set (see save_processed_emails
+# fix above). FIND_IN_SET matches whole label tokens exactly
+# (COALESCE guards NULL labels); LIKE '%INBOX%' would also match a
+# hypothetical 'XINBOX' token and is not used for folder tests.
+# Every predicate is written against alias ``p`` (the latest message
+# of a thread); list_threads() and get_folder_counts() share this one
+# helper so a folder list and its count can never disagree.
 
-    - unread: unread rows in the inbox.
-    - today: received today in Asia/Kolkata. received_at is stored as
-      naive UTC; CONVERT_TZ shifts it to IST before taking the date.
-      (Caveat: CONVERT_TZ returns NULL if the server's time-zone tables
-      lack the named offsets — TiDB ships +00:00/+05:30 as fixed offsets,
-      so this is safe here, but if `today` ever reads 0 while mail
-      arrived today, check CONVERT_TZ first.)
-    - urgent: subject matches the urgent keywords.
-    - needs_reply: the SQL approximation of the _needs_reply heuristic.
-    - total_threads: distinct threads (NULL thread_id = own thread).
+def _label_present(label: str, alias: str = "p") -> str:
+    return f"FIND_IN_SET('{label}', COALESCE({alias}.labels, '')) > 0"
+
+
+def _label_absent(label: str, alias: str = "p") -> str:
+    return f"FIND_IN_SET('{label}', COALESCE({alias}.labels, '')) = 0"
+
+
+def _folder_predicate_sql(folder: str, alias: str = "p") -> tuple[str, list[Any]]:
+    """(SQL, params) for one folder, tested on the thread's latest message.
+
+    - inbox: INBOX present, not TRASH/SPAM.
+    - sent: SENT label. - drafts: DRAFT label (Gmail-side drafts; the
+      server drafts table is unioned in list_threads / added in
+      get_folder_counts — see there).
+    - archive: no INBOX, no TRASH/SPAM, not a draft.
+    - trash: TRASH. - spam: SPAM.
+    - starred: STARRED label, not trashed (keeps archived visible, like Gmail).
+    - unread: UNREAD label, in the inbox (INBOX present, not TRASH/SPAM).
+    - urgent: urgent subject, in the inbox.
+    - reply: needs-reply heuristic, in the inbox.
+    - all: everything except trashed.
+    """
+    a = alias
+    inbox_base = f"{_label_present('INBOX', a)} AND {_label_absent('TRASH', a)} AND {_label_absent('SPAM', a)}"
+    if folder == "inbox":
+        return inbox_base, []
+    if folder == "sent":
+        return _label_present("SENT", a), []
+    if folder == "drafts":
+        return _label_present("DRAFT", a), []
+    if folder == "archive":
+        return (
+            f"{_label_absent('INBOX', a)} AND {_label_absent('TRASH', a)} "
+            f"AND {_label_absent('SPAM', a)} AND {_label_absent('DRAFT', a)}",
+            [],
+        )
+    if folder == "trash":
+        return _label_present("TRASH", a), []
+    if folder == "spam":
+        return _label_present("SPAM", a), []
+    if folder == "starred":
+        return f"{_label_present('STARRED', a)} AND {_label_absent('TRASH', a)}", []
+    if folder == "unread":
+        return f"{_label_present('UNREAD', a)} AND {inbox_base}", []
+    if folder == "urgent":
+        return f"{_urgent_subject_sql(a)} AND {inbox_base}", list(_URGENT_SUBJECT_LIKES)
+    if folder == "reply":
+        # _NEEDS_REPLY_SQL is unaliased; it resolves to `p` because no
+        # other table in these queries carries those columns.
+        return f"{_NEEDS_REPLY_SQL} AND {inbox_base}", []
+    if folder == "all":
+        return _label_absent("TRASH", a), []
+    raise ValueError(f"Unknown folder: {folder}")
+
+
+def get_inbox_counts() -> dict:
+    """SQL counts for the dashboard, over INBOX threads only.
+
+    Phase 2 re-scope (diagnostic 2026-11-16): the old base was
+    ``is_archived = FALSE AND is_trashed = FALSE`` with no INBOX-label
+    test and no category test, so Sent threads and CATEGORY_UPDATES /
+    CATEGORY_FORUMS threads — invisible in every inbox tab — were
+    counted, and total_threads (30) disagreed with the visible tabs
+    (15). The base is now the INBOX label (present, not TRASH/SPAM),
+    so total_threads equals the number of threads across the five
+    inbox category tabs. Message-level sums (unread/today/urgent/
+    needs_reply) use the same INBOX base; total_threads counts
+    distinct threads.
     """
     from zoneinfo import ZoneInfo
 
@@ -592,8 +698,8 @@ def get_inbox_counts() -> dict:
                 COALESCE(SUM(CASE WHEN {_urgent_subject_sql()} THEN 1 ELSE 0 END), 0) AS urgent,
                 COALESCE(SUM(CASE WHEN {_NEEDS_REPLY_SQL} THEN 1 ELSE 0 END), 0) AS needs_reply,
                 COUNT(DISTINCT COALESCE(thread_id, message_id)) AS total_threads
-            FROM processed_emails
-            WHERE is_archived = FALSE AND is_trashed = FALSE
+            FROM processed_emails p
+            WHERE {_label_present('INBOX')} AND {_label_absent('TRASH')} AND {_label_absent('SPAM')}
             """,
             (today_ist, *_URGENT_SUBJECT_LIKES),
         )
@@ -607,9 +713,58 @@ def get_inbox_counts() -> dict:
     }
 
 
+def get_folder_counts() -> dict:
+    """Per-folder THREAD counts, over each thread's latest message.
+
+    Uses the exact same _folder_predicate_sql() as list_threads(), so
+    a folder's count always equals the number of rows its list can
+    return (same base, same predicates, same latest-message rule).
+    The drafts count adds the server drafts table rows to the
+    Gmail-DRAFT threads, matching the drafts-folder union in
+    list_threads().
+    """
+    folders = ("inbox", "sent", "drafts", "archive", "trash", "spam",
+               "starred", "unread", "urgent", "reply", "all")
+    select_parts: list[str] = []
+    params: list[Any] = []
+    for folder in folders:
+        pred_sql, pred_params = _folder_predicate_sql(folder, "p")
+        select_parts.append(
+            "COUNT(DISTINCT CASE WHEN "
+            f"{pred_sql} THEN COALESCE(p.thread_id, p.message_id) END) AS `{folder}`"
+        )
+        params.extend(pred_params)
+    with get_db_cursor() as cur:
+        cur.execute(
+            "SELECT " + ", ".join(select_parts) + " "
+            "FROM processed_emails p "
+            "JOIN (SELECT COALESCE(thread_id, message_id) AS tkey, MAX(id) AS max_id "
+            "FROM processed_emails GROUP BY tkey) latest ON p.id = latest.max_id",
+            tuple(params),
+        )
+        row = cur.fetchone() or {}
+        try:
+            cur.execute("SELECT COUNT(*) AS n FROM drafts")
+            server_drafts = int((cur.fetchone() or {}).get("n") or 0)
+        except Exception:
+            # Drafts table predates this deploy (init_db runs in a
+            # background thread); count mail drafts only until it exists.
+            server_drafts = 0
+    counts = {f: int(row.get(f) or 0) for f in folders}
+    counts["drafts"] = counts["drafts"] + server_drafts
+    return counts
+
+
 # ---- Keyset pagination over threads ----
 
-_VALID_FOLDERS = ("inbox", "starred", "unread", "urgent", "reply", "all")
+_VALID_FOLDERS = ("inbox", "starred", "unread", "urgent", "reply", "all",
+                  "sent", "drafts", "archive", "trash", "spam")
+# Folders whose rows come from the drafts-table union (see
+# list_threads): server drafts sort before Gmail drafts.
+_DRAFT_SORT_ID_OFFSET = 2_000_000_000
+# A thread's latest message can never have a processed_emails id this
+# large in practice (150 mails per sync run); the offset keeps the two
+# id spaces in one keyset ordering without a second cursor format.
 _VALID_CATS = (None, "primary", "social", "promotions", "updates", "forums")
 _CAT_LABEL = {
     "social": "CATEGORY_SOCIAL",
@@ -667,30 +822,16 @@ def list_threads(folder: str = "inbox", cat: Optional[str] = None,
 
     last_id = _decode_cursor(cursor, folder, cat, q) if cursor else None
 
-    # Folder predicate on the latest message of the thread.
-    # Non-inbox folders must never surface trashed threads (and
-    # unread/urgent/reply also exclude archived ones, matching the old
-    # client-side activeMails() filter). Starred keeps archived mail
-    # visible, like Gmail's Starred view.
-    if folder == "inbox":
-        folder_sql = "p.is_archived = FALSE AND p.is_trashed = FALSE"
-    elif folder == "starred":
-        folder_sql = "p.is_starred = TRUE AND p.is_trashed = FALSE"
-    elif folder == "unread":
-        folder_sql = "p.is_unread = TRUE AND p.is_archived = FALSE AND p.is_trashed = FALSE"
-    elif folder == "urgent":
-        folder_sql = _urgent_subject_sql("p") + " AND p.is_archived = FALSE AND p.is_trashed = FALSE"
-    elif folder == "reply":
-        # _NEEDS_REPLY_SQL references is_unread/labels/sender/subject
-        # unaliased; in this query only `p` has those columns, so they
-        # resolve to the thread's latest message.
-        folder_sql = _NEEDS_REPLY_SQL + " AND p.is_archived = FALSE AND p.is_trashed = FALSE"
-    else:  # "all": everything except trashed.
-        folder_sql = "p.is_trashed = FALSE"
+    if folder == "drafts":
+        return _list_draft_threads(cat=cat, q=q, limit=limit, last_id=last_id)
 
-    params: list[Any] = []
-    if folder == "urgent":
-        params.extend(_URGENT_SUBJECT_LIKES)
+    # Folder predicate on the latest message of the thread, from the
+    # stored Gmail labels CSV (see _folder_predicate_sql). Starred
+    # keeps archived mail visible, like Gmail's Starred view; every
+    # other mail folder excludes trash, and unread/urgent/reply are
+    # inbox-scoped.
+    folder_sql, folder_params = _folder_predicate_sql(folder, "p")
+    params: list[Any] = list(folder_params)
 
     cat_sql = ""
     if cat in _CAT_LABEL:
@@ -746,6 +887,208 @@ def list_threads(folder: str = "inbox", cat: Optional[str] = None,
     page_rows = rows[:limit]
     next_cursor = _encode_cursor(page_rows[-1]["id"], folder, cat, q) if has_more and page_rows else None
     return page_rows, next_cursor, has_more
+
+
+def _list_draft_threads(cat: Optional[str], q: Optional[str], limit: int,
+                        last_id: Optional[int]) -> tuple[list[dict], Optional[str], bool]:
+    """Drafts folder: UNION of Gmail drafts + server drafts, one keyset.
+
+    - Gmail drafts: threads whose latest message carries the DRAFT
+      label (same latest-message rule as every other folder).
+    - Server drafts: rows of the ``drafts`` table (compose/reply
+      autosaves), shaped into the same thread-like columns with
+      ``is_draft=1`` and ``draft_id`` set, so the API layer can tell
+      them apart from mail rows.
+    - One keyset, no OFFSET: server-draft sort ids are
+      ``draft id + _DRAFT_SORT_ID_OFFSET`` (2e9 — a real mail id can
+      never reach it), so both parts share the single integer ``id``
+      ordering and the v1 cursor format is unchanged. Server drafts
+      sort before Gmail drafts. ``cat`` is ignored here (drafts have
+      no inbox category); ``q`` matches subject/body/recipients.
+    """
+    mail_pred, _ = _folder_predicate_sql("drafts", "p")
+    mail_params: list[Any] = []
+    q_sql_mail = ""
+    if q:
+        pattern = f"%{q}%"
+        q_sql_mail = " AND (p.subject LIKE %s OR p.sender LIKE %s OR p.snippet LIKE %s)"
+        mail_params.extend([pattern, pattern, pattern])
+    mail_cursor_sql = ""
+    if last_id is not None:
+        mail_cursor_sql = " AND p.id < %s"
+        mail_params.append(last_id)
+
+    draft_params: list[Any] = []
+    q_sql_draft = ""
+    if q:
+        pattern = f"%{q}%"
+        q_sql_draft = " WHERE (d.subject LIKE %s OR d.body LIKE %s OR d.to_addrs LIKE %s)"
+        draft_params.extend([pattern, pattern, pattern])
+    draft_cursor_sql = ""
+    if last_id is not None:
+        draft_cursor_sql = (
+            (" AND " if q_sql_draft else " WHERE ")
+            + f"(d.id + {_DRAFT_SORT_ID_OFFSET}) < %s"
+        )
+        draft_params.append(last_id)
+
+    with get_db_cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT p.id AS id, p.message_id AS message_id, p.thread_id AS thread_id,
+                p.sender AS sender, p.subject AS subject, p.snippet AS snippet,
+                p.is_unread AS is_unread, p.is_starred AS is_starred,
+                p.labels AS labels, p.is_archived AS is_archived,
+                p.is_trashed AS is_trashed, p.received_at AS received_at,
+                p.created_at AS created_at, p.created_at AS updated_at,
+                (SELECT COUNT(*) FROM processed_emails t
+                 WHERE COALESCE(t.thread_id, t.message_id) = COALESCE(p.thread_id, p.message_id)) AS message_count,
+                (SELECT COUNT(*) FROM processed_emails t
+                 WHERE COALESCE(t.thread_id, t.message_id) = COALESCE(p.thread_id, p.message_id)
+                   AND t.is_unread = TRUE) AS unread_count,
+                0 AS is_draft, NULL AS draft_id,
+                NULL AS to_addrs, NULL AS cc_addrs, NULL AS bcc_addrs,
+                NULL AS body_text
+            FROM processed_emails p
+            JOIN (
+                SELECT COALESCE(thread_id, message_id) AS tkey, MAX(id) AS max_id
+                FROM processed_emails GROUP BY tkey
+            ) latest ON p.id = latest.max_id
+            WHERE {mail_pred}{q_sql_mail}{mail_cursor_sql}
+            UNION ALL
+            SELECT (d.id + {_DRAFT_SORT_ID_OFFSET}) AS id, NULL AS message_id,
+                d.thread_id AS thread_id, 'Me' AS sender,
+                d.subject AS subject, LEFT(COALESCE(d.body, ''), 200) AS snippet,
+                0 AS is_unread, 0 AS is_starred, 'DRAFT' AS labels,
+                0 AS is_archived, 0 AS is_trashed,
+                d.updated_at AS received_at, d.created_at AS created_at,
+                d.updated_at AS updated_at,
+                1 AS message_count, 0 AS unread_count,
+                1 AS is_draft, d.id AS draft_id,
+                d.to_addrs AS to_addrs, d.cc_addrs AS cc_addrs,
+                d.bcc_addrs AS bcc_addrs, d.body AS body_text
+            FROM drafts d
+            {q_sql_draft}{draft_cursor_sql}
+            ORDER BY id DESC
+            LIMIT %s
+            """,
+            tuple(mail_params + draft_params + [limit + 1]),
+        )
+        rows = cur.fetchall()
+
+    has_more = len(rows) > limit
+    page_rows = rows[:limit]
+    next_cursor = _encode_cursor(page_rows[-1]["id"], "drafts", cat, q) if has_more and page_rows else None
+    return page_rows, next_cursor, has_more
+
+
+# ================= Drafts (server-side, Phase 2) =================
+
+def _draft_row_to_dict(row: Optional[dict]) -> Optional[dict]:
+    """One drafts-table row -> plain dict (datetimes ISO, addrs as lists)."""
+    if not row:
+        return None
+
+    def _split(raw: Any) -> list[str]:
+        return [p.strip() for p in str(raw or "").split(",") if p.strip()]
+
+    return {
+        "id": row["id"],
+        "to": _split(row.get("to_addrs")),
+        "cc": _split(row.get("cc_addrs")),
+        "bcc": _split(row.get("bcc_addrs")),
+        "subject": row.get("subject") or "",
+        "body": row.get("body") or "",
+        "thread_id": row.get("thread_id"),
+        "message_id": row.get("message_id"),
+        "created_at": row["created_at"].isoformat() if row.get("created_at") else None,
+        "updated_at": row["updated_at"].isoformat() if row.get("updated_at") else None,
+    }
+
+
+def create_draft(to_addrs: list[str], cc_addrs: list[str], bcc_addrs: list[str],
+                 subject: str, body: str,
+                 thread_id: Optional[str] = None,
+                 message_id: Optional[str] = None) -> dict:
+    """Insert a server draft; returns the created draft dict."""
+    with get_db_cursor(commit=True) as cur:
+        cur.execute(
+            """
+            INSERT INTO drafts (to_addrs, cc_addrs, bcc_addrs, subject, body, thread_id, message_id)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """,
+            (",".join(to_addrs), ",".join(cc_addrs), ",".join(bcc_addrs),
+             subject or "", body or "", thread_id, message_id),
+        )
+        draft_id = cur.lastrowid
+    draft = get_draft(draft_id)
+    assert draft is not None
+    return draft
+
+
+def get_draft(draft_id: int) -> Optional[dict]:
+    """One draft by id, or None."""
+    with get_db_cursor() as cur:
+        cur.execute("SELECT * FROM drafts WHERE id = %s", (int(draft_id),))
+        return _draft_row_to_dict(cur.fetchone())
+
+
+def list_drafts(limit: int = 30, cursor: Optional[str] = None) -> tuple[list[dict], Optional[str], bool]:
+    """Server drafts only, newest first, keyset on drafts.id DESC.
+
+    Its own cursor namespace (folder="drafts_list") so a drafts-table
+    cursor can never be mistaken for a drafts-FOLDER cursor (the
+    folder union sorts on offset ids — see _list_draft_threads).
+    """
+    limit = max(1, min(100, int(limit or 30)))
+    last_id = _decode_cursor(cursor, "drafts_list", None, None) if cursor else None
+    with get_db_cursor() as cur:
+        if last_id is not None:
+            cur.execute(
+                "SELECT * FROM drafts WHERE id < %s ORDER BY id DESC LIMIT %s",
+                (last_id, limit + 1),
+            )
+        else:
+            cur.execute(
+                "SELECT * FROM drafts ORDER BY id DESC LIMIT %s",
+                (limit + 1,),
+            )
+        rows = [_draft_row_to_dict(r) for r in cur.fetchall()]
+    has_more = len(rows) > limit
+    page_rows = rows[:limit]
+    next_cursor = _encode_cursor(page_rows[-1]["id"], "drafts_list", None, None) if has_more and page_rows else None
+    return page_rows, next_cursor, has_more
+
+
+def update_draft(draft_id: int, updates: dict) -> Optional[dict]:
+    """Partial update of a draft; returns the updated draft, or None
+    when the id does not exist. Only whitelisted columns are written;
+    ``to``/``cc``/``bcc`` accept address lists (stored comma-joined)."""
+    allowed = {"to_addrs", "cc_addrs", "bcc_addrs", "subject", "body", "thread_id", "message_id"}
+    clauses: list[str] = []
+    params: list[Any] = []
+    for key, value in (updates or {}).items():
+        if key in ("to", "cc", "bcc"):
+            key = f"{key}_addrs"
+            value = ",".join(value) if isinstance(value, (list, tuple)) else str(value or "")
+        if key in allowed:
+            clauses.append(f"{key} = %s")
+            params.append(value)
+    if not clauses:
+        return get_draft(draft_id)
+    params.append(int(draft_id))
+    with get_db_cursor(commit=True) as cur:
+        cur.execute(f"UPDATE drafts SET {', '.join(clauses)} WHERE id = %s", tuple(params))
+        if cur.rowcount == 0:
+            return None
+    return get_draft(draft_id)
+
+
+def delete_draft(draft_id: int) -> bool:
+    """Delete a draft; True when a row was removed."""
+    with get_db_cursor(commit=True) as cur:
+        cur.execute("DELETE FROM drafts WHERE id = %s", (int(draft_id),))
+        return cur.rowcount > 0
 
 # ================= Configuration Management =================
 
@@ -1049,10 +1392,19 @@ def get_dashboard_summary():
             logger.warning(f"Could not compute inbox counts: {e}")
             inbox_counts = None
 
+        # Per-folder thread counts (same predicates as the folder lists,
+        # so sidebar badges agree with what each folder shows).
+        try:
+            folder_counts = get_folder_counts()
+        except Exception as e:
+            logger.warning(f"Could not compute folder counts: {e}")
+            folder_counts = None
+
         return {
             "latest": latest,
             "history": history,
             "recent_emails": recent_emails,
             "lifetime_emails": lifetime_emails.get("count", 0) if lifetime_emails else 0,
-            "inbox_counts": inbox_counts
+            "inbox_counts": inbox_counts,
+            "folder_counts": folder_counts
         }

@@ -11,3 +11,4 @@ python-dotenv==1.0.1
 markdown==3.7
 psutil==6.1.0
 tzdata==2025.1
+python-multipart==0.0.20

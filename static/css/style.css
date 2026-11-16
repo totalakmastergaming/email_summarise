@@ -551,3 +551,47 @@
     #reader .gm-error{margin:16px 16px 20px 16px}
     .thread-msg-email{display:none}
   }
+
+  /* ---------- Phase 2: folders, Updates/Forums, attachments, CC/BCC, drafts ---------- */
+  .gm-tab[data-cat="updates"].active,.gm-tab[data-cat="forums"].active{color:var(--gm-text)}
+  .gm-tab[data-cat="updates"].active::after,.gm-tab[data-cat="forums"].active::after{background:var(--gm-text)}
+  .gm-new.updates,.gm-new.forums{background:var(--gm-text2)}
+  @media (prefers-color-scheme: dark){ .gm-new.updates,.gm-new.forums{color:#202124} }
+  /* Attachments in the reader */
+  .att-list{margin:6px 24px 4px 78px;border-top:1px solid var(--gm-border);padding-top:10px}
+  .att-list h4{margin:0 0 8px;font-size:12.5px;font-weight:700;color:var(--gm-text2)}
+  .att-item{
+    display:flex;align-items:center;gap:8px;width:100%;text-align:left;
+    border:1px solid var(--gm-border);border-radius:8px;background:var(--gm-bg);
+    padding:8px 12px;margin-bottom:6px;font-size:13.5px;color:var(--gm-text);min-height:40px;
+  }
+  .att-item:hover{background:var(--gm-hover)}
+  .att-item svg{width:16px;height:16px;fill:var(--gm-text2);flex:none}
+  .att-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .att-size{margin-left:auto;font-size:12px;color:var(--gm-text2);flex:none}
+  .att-error{margin:6px 24px 4px 78px}
+  @media (max-width:720px){ .att-list,.att-error{margin-left:16px;margin-right:16px} }
+  /* Compose: Cc/Bcc row, attachments, draft status, notes */
+  .cc-row{display:flex;align-items:center;gap:8px}
+  .cc-row .gm-textbtn{padding:4px 8px}
+  .draft-status{margin-left:auto;font-size:12px;color:var(--text-3);text-align:right}
+  .draft-status.error{color:var(--red);font-weight:700;cursor:pointer}
+  .attach-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  .attach-total{font-size:12.5px;color:var(--text-3)}
+  .attach-item{
+    display:flex;align-items:center;gap:8px;border:1px solid var(--border);border-radius:8px;
+    padding:6px 10px;margin-top:6px;font-size:13px;color:var(--text-2);background:var(--surface);
+  }
+  .attach-item .att-name{flex:1;min-width:0}
+  .attach-item button{color:var(--red);font-weight:700;font-size:13px;padding:2px 6px;flex:none}
+  .compose-note{
+    background:var(--amber-soft);border:1px solid var(--amber);border-radius:8px;
+    padding:8px 10px;font-size:13px;color:var(--text);line-height:1.5;
+  }
+  .compose-note[hidden]{display:none}
+  /* Reply box: Cc/Bcc + attachments reuse the compose styles */
+  .gm-replybox .cc-row{padding:2px 6px 0}
+  .gm-replybox .attach-row{padding:6px 12px 0}
+  .gm-replybox .attach-item{margin:6px 12px 0}
+  .gm-replybox .compose-note{margin:8px 12px 0}
+  .gm-replybox .reply-ccbcc{width:100%;border:0;border-bottom:1px solid var(--gm-border);outline:none;background:none;padding:8px 12px;font-size:14px;color:var(--gm-text);font-family:inherit}

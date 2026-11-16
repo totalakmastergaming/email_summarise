@@ -18,6 +18,25 @@ var pager = { page: 1, cursors: [null], nextCursor: null, hasMore: false, loadin
 /* Last inbox page-load failure message (null = no error). Shown as an
    inline error row in the inbox list with a Retry button. */
 var inboxLoadError = null;
+/* Per-folder counts from the last /api/dashboard response
+   (folder_counts map), when the backend provides them. Null = fall
+   back to counting the loaded page for the current folder only. */
+var FOLDER_COUNTS = null;
+/* Attachments: total cap for one message (10 MB, per the Phase 2
+   diagnostic — Gmail allows 25 MB, 10 MB bounds free-tier memory). */
+var ATTACH_MAX_TOTAL = 10 * 1024 * 1024;
+/* Files staged in compose / reply (File objects, never sent anywhere
+   except the send call). Forward re-attached files land here too. */
+var composeAttachments = [];
+var replyAttachments = [];
+/* Attachments the forward flow could not re-attach, shown in compose
+   instead of being silently dropped: [{filename, reason}]. */
+var forwardSkipped = [];
+/* Draft autosave: the server draft id once one exists (null = unsaved),
+   the debounce timer, and the visible save state. */
+var currentDraftId = null;
+var draftTimer = null;
+var draftSaveState = "idle"; /* idle | saving | saved | error */
 /* Current open thread (GET /api/threads/{id}) and its load state. */
 var THREAD = null;
 var THREAD_LOADING = false;
@@ -138,6 +157,30 @@ function stripUnsafeHtml(html){
 function initials(name){
   return name.split(" ").filter(Boolean).slice(0,2).map(function(w){return w[0];}).join("").toUpperCase();
 }
+/* Phase 2 helpers: folders, addresses, sizes, drafts. */
+var FOLDER_LABELS = { inbox: "Inbox", starred: "Starred", unread: "Unread", urgent: "Urgent", reply: "Awaiting reply", sent: "Sent", drafts: "Drafts", archive: "Archive", trash: "Trash", spam: "Spam" };
+function folderLabel(f){ return FOLDER_LABELS[f] || "Inbox"; }
+function isStoredFolder(f){ return f === "archive" || f === "trash" || f === "spam"; }
+function formatBytes(n){
+  n = Number(n) || 0;
+  if(n < 1024) return n + " B";
+  if(n < 1024 * 1024) return (n / 1024).toFixed(1).replace(/\.0$/, "") + " KB";
+  return (n / (1024 * 1024)).toFixed(1).replace(/\.0$/, "") + " MB";
+}
+function formatClock(d){
+  try { return new Date(d).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }); }
+  catch(e){ return ""; }
+}
+/* "a@x.com, b@y.com" -> ["a@x.com", "b@y.com"]; "" -> []. A string or
+   an array is accepted, so draft objects and inputs share this. */
+function parseAddressList(v){
+  if(Array.isArray(v)) return v.map(function(s){ return String(s).trim(); }).filter(Boolean);
+  if(typeof v !== "string") return [];
+  return v.split(",").map(function(s){ return s.trim(); }).filter(Boolean);
+}
+function addressListToString(v){
+  return parseAddressList(v).join(", ");
+}
 function avatarColor(name){
   var colors=["#4a4a6e","#37505f","#5b4636","#3f5a46","#5a3d55","#44506e","#6e4a3a"];
   var h=0; for(var i=0;i<name.length;i++){ h=(h*31+name.charCodeAt(i))>>>0; }
@@ -203,6 +246,7 @@ function renderStats(){
   $("#statReply").textContent=c.reply;
   $("#navUnread").textContent=c.unread;
   $("#navUrgent").textContent=c.urgent;
+  renderFolderBadges();
   $("#statUnreadSub").innerHTML = c.unread>0 ? "Across "+totalThreads+" conversations in your inbox" : "Inbox zero — nothing unread";
   $("#statTodaySub").innerHTML = "Since 12:00 AM today · <b>"+pool.filter(function(m){return m.today&&m.unread;}).length+" still unread</b>";
   var firstUrgent = pool.filter(function(m){return m.urgent;})[0];
@@ -219,13 +263,34 @@ function renderStats(){
   if(extra.length) pts.push("<li><span class='dot'></span><span>Also awaiting a reply: <b>"+extra.map(function(m){return escapeHtml(m.sender);}).join(", ")+"</b>.</span></li>");
   $("#aiBriefPoints").innerHTML = pts.join("");
 }
+/* Sidebar folder badges from the dashboard folder_counts map. When
+   the backend does not provide it, only the currently loaded folder
+   shows a count (the loaded page size) — other folders show no badge
+   rather than a made-up number. */
+function renderFolderBadges(){
+  var folders = ["sent", "drafts", "archive", "trash", "spam"];
+  var cur = (typeof currentFolder === "function") ? currentFolder() : "inbox";
+  folders.forEach(function(f){
+    var el = document.getElementById("nav" + f.charAt(0).toUpperCase() + f.slice(1));
+    if(!el) return;
+    var n = null;
+    if(FOLDER_COUNTS && FOLDER_COUNTS[f] != null) n = FOLDER_COUNTS[f];
+    else if(f === cur && MAILS) n = MAILS.length;
+    if(n == null || n === 0){ el.hidden = true; }
+    else { el.hidden = false; el.textContent = n; }
+  });
+}
 function filteredMails(){
   var q=state.query.trim().toLowerCase();
-  /* While searching, the pool is the server result set (SEARCH_RESULTS);
-     otherwise it is the loaded inbox. Stats always use MAILS. */
+  var folder = currentFolder();
+  /* Archived/trashed rows live in MAILS for the Archive/Trash/Spam
+     folders — activeMails() would filter them out and the folder
+     would always look empty. Drafts/Sent rows are not archived or
+     trashed either, but they share the same unfiltered pool. */
+  var base = (isStoredFolder(folder) || folder === "drafts" || folder === "sent") ? MAILS : activeMails();
   var pool = (q && SEARCH_RESULTS)
-    ? SEARCH_RESULTS.filter(function(m){ return !m.trashed && !m.archived; })
-    : activeMails();
+    ? SEARCH_RESULTS.filter(function(m){ return isStoredFolder(folder) ? true : (!m.trashed && !m.archived); })
+    : base;
   return pool.filter(function(m){
     if(q && (m.sender+" "+m.subject+" "+m.snippet).toLowerCase().indexOf(q)===-1) return false;
     if(state.filter==="unread" && !m.unread) return false;
@@ -247,11 +312,28 @@ var ICO = {
   mailOpen:'<svg viewBox="0 0 24 24"><path d="M21.99 8c0-.72-.37-1.35-.94-1.7L12 1 2.95 6.3C2.38 6.65 2 7.28 2 8v10c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8zM12 13 3.74 7.84 12 3l8.26 4.84L12 13z"/></svg>',
   snooze:'<svg viewBox="0 0 24 24"><path d="M11.99 2C6.47 2 2 6.48 2 12s4.47 10 9.99 10C17.52 22 22 17.52 22 12S17.52 2 11.99 2zM12 20c-4.42 0-8-3.58-8-8s3.58-8 8-8 8 3.58 8 8-3.58 8-8 8zm.5-13H11v6l5.25 3.15.75-1.23-4.5-2.67V7z"/></svg>',
   reply:'<svg viewBox="0 0 24 24"><path d="M10 9V5l-7 7 7 7v-4.1c5 0 8.5 1.6 11 5.1-1-5-4-10-11-11z"/></svg>',
+  restore:'<svg viewBox="0 0 24 24"><path d="M12.5 8c-2.65 0-5.05.99-6.9 2.6L2 7v9h9l-3.62-3.62c1.39-1.16 3.16-1.88 5.12-1.88 3.54 0 6.55 2.31 7.6 5.5l2.37-.78C21.08 11.03 17.15 8 12.5 8z"/></svg>',
   forward:'<svg viewBox="0 0 24 24"><path d="M14 9V5l7 7-7 7v-4.1c-5 0-8.5 1.6-11 5.1 1-5 4-10 11-11z"/></svg>'
 };
 function gmRowHtml(m){
   var tk = threadKey(m);
   var sel = !!state.selected[tk];
+  var folder = currentFolder();
+  /* Hover actions depend on the folder: Trash/Spam/Archive rows offer
+     Restore instead of Archive/Delete; draft rows offer Delete only
+     (deleting a draft removes the server draft, not a Gmail thread). */
+  var actions;
+  if(m.draft_id){
+    actions = '<button class="gm-tbtn sm" data-act="trash" data-id="'+tk+'" aria-label="Delete draft">'+ICO.trash+'</button>';
+  } else if(isStoredFolder(folder)){
+    actions = '<button class="gm-tbtn sm" data-act="restore" data-id="'+tk+'" aria-label="Restore to inbox">'+ICO.restore+'</button>'
+      + '<button class="gm-tbtn sm" data-act="read" data-id="'+tk+'" aria-label="Mark as '+(m.unread?"read":"unread")+'">'+(m.unread?ICO.mailOpen:ICO.mailClosed)+'</button>';
+  } else {
+    actions = '<button class="gm-tbtn sm" data-act="archive" data-id="'+tk+'" aria-label="Archive">'+ICO.archive+'</button>'
+    + '<button class="gm-tbtn sm" data-act="trash" data-id="'+tk+'" aria-label="Delete">'+ICO.trash+'</button>'
+    + '<button class="gm-tbtn sm" data-act="read" data-id="'+tk+'" aria-label="Mark as '+(m.unread?"read":"unread")+'">'+(m.unread?ICO.mailOpen:ICO.mailClosed)+'</button>'
+    + '<button class="gm-tbtn sm" data-act="snooze" data-id="'+tk+'" aria-label="Snooze">'+ICO.snooze+'</button>';
+  }
   return '<div class="gm-row'+(m.unread?" unread":"")+(sel?" checked":"")+'" data-open="'+tk+'" role="button" tabindex="0">'
     + '<button class="gm-check sm'+(sel?" on":"")+'" data-select="'+tk+'" aria-label="Select conversation"><span class="box">'+ICO.check+'</span></button>'
     + '<button class="gm-star'+(m.starred?" on":"")+'" data-star="'+tk+'" aria-label="Star this mail">'+(m.starred?ICO.starF:ICO.starO)+'</button>'
@@ -260,12 +342,7 @@ function gmRowHtml(m){
     + '<span class="gm-mid"><span class="gm-subj">'+escapeHtml(m.subject)+'</span>'+countBadge(m)+'<span class="gm-snip"> — '+escapeHtml(m.snippet)+'</span></span>'
     + '<span class="gm-labelchip">'+escapeHtml(m.tag)+'</span>'
     + '<span class="gm-date num">'+escapeHtml(m.time)+'</span>'
-    + '<span class="gm-actions">'
-    + '<button class="gm-tbtn sm" data-act="archive" data-id="'+tk+'" aria-label="Archive">'+ICO.archive+'</button>'
-    + '<button class="gm-tbtn sm" data-act="trash" data-id="'+tk+'" aria-label="Delete">'+ICO.trash+'</button>'
-    + '<button class="gm-tbtn sm" data-act="read" data-id="'+tk+'" aria-label="Mark as '+(m.unread?"read":"unread")+'">'+(m.unread?ICO.mailOpen:ICO.mailClosed)+'</button>'
-    + '<button class="gm-tbtn sm" data-act="snooze" data-id="'+tk+'" aria-label="Snooze">'+ICO.snooze+'</button>'
-    + '</span></div>';
+    + '<span class="gm-actions">' + actions + '</span></div>';
 }
 function selectedIds(){
   return Object.keys(state.selected).filter(function(k){ return state.selected[k]; });
@@ -286,13 +363,23 @@ function renderGmailChrome(){
   var older=$("#gmOlder"), newer=$("#gmNewer");
   if(older) older.disabled = !pager.hasMore || pager.loading;
   if(newer) newer.disabled = pager.page <= 1 || pager.loading;
-  /* Tab "new" badges = unread in that category (page-1 pool). */
+  /* Tab "new" badges = unread in that category (page-1 pool), same
+     pattern for all five tabs. Note the pool is the Primary page-1
+     snapshot, so a badge only counts what that snapshot holds — the
+     backend would need per-category counts for exact tab badges. */
   var pool = dashPool();
   var soc = pool.filter(function(m){ return m.cat==="social" && m.unread; }).length;
   var pro = pool.filter(function(m){ return m.cat==="promotions" && m.unread; }).length;
-  var bs=$("#gmNewSocial"), bp=$("#gmNewPromo");
+  var upd = pool.filter(function(m){ return m.cat==="updates" && m.unread; }).length;
+  var frm = pool.filter(function(m){ return m.cat==="forums" && m.unread; }).length;
+  var bs=$("#gmNewSocial"), bp=$("#gmNewPromo"), bu=$("#gmNewUpdates"), bf=$("#gmNewForums");
   if(bs){ bs.hidden = soc===0; bs.textContent = soc+" new"; }
   if(bp){ bp.hidden = pro===0; bp.textContent = pro+" new"; }
+  if(bu){ bu.hidden = upd===0; bu.textContent = upd+" new"; }
+  if(bf){ bf.hidden = frm===0; bf.textContent = frm+" new"; }
+  /* Category tabs only exist for the inbox; folder views hide them. */
+  var tabsEl=$("#gmTabs");
+  if(tabsEl) tabsEl.hidden = currentFolder() !== "inbox" || state.filter !== "all";
   $$("#gmTabs .gm-tab").forEach(function(t){
     var on = state.filter==="all" && !state.query && t.getAttribute("data-cat")===state.cat;
     t.classList.toggle("active", on);
@@ -314,6 +401,7 @@ function renderGmailChrome(){
   else if(state.filter==="urgent") label = "Urgent — across all tabs";
   else if(state.filter==="unread") label = "Unread — across all tabs";
   else if(state.filter==="reply") label = "Needs reply — across all tabs";
+  else if(state.filter==="sent" || state.filter==="drafts" || state.filter==="archive" || state.filter==="trash" || state.filter==="spam") label = folderLabel(state.filter);
   if(fb){ fb.hidden = !label; if(label) ft.textContent = label; }
 }
 function renderLists(){
@@ -322,7 +410,20 @@ function renderLists(){
   $("#urgentList").innerHTML = urgent.length ? urgent.map(miniRowHtml).join("") : '<div class="empty">Nothing urgent right now.</div>';
   $("#recentList").innerHTML = pool.slice(0,5).map(mailRowHtml).join("");
   var list = filteredMails();
-  var emptyMsg = state.query ? "No mail matches your search." : (state.cat==="social" ? "No social mail here." : state.cat==="promotions" ? "No promotions here." : "Your Primary tab is empty.");
+  var folderEmpty = {
+    sent: "No sent mail yet.",
+    drafts: "No drafts yet — start a message and it will autosave here.",
+    archive: "Nothing archived yet.",
+    trash: "Trash is empty.",
+    spam: "No spam here."
+  };
+  var emptyMsg = state.query ? "No mail matches your search."
+    : (folderEmpty[state.filter] ? folderEmpty[state.filter]
+    : (state.cat==="social" ? "No social mail here."
+    : state.cat==="promotions" ? "No promotions here."
+    : state.cat==="updates" ? "No updates here."
+    : state.cat==="forums" ? "No forum mail here."
+    : "Your Primary tab is empty."));
   var html = "";
   /* A failed page load keeps the existing list on screen and adds this
      error row on top; with nothing loaded it is the whole list area. */
@@ -364,6 +465,45 @@ function messageBodyHtml(msg){
   if(msg._bodyIsHtml) return (msg.body || []).map(function(p){ return "<p>"+p+"</p>"; }).join("");
   return (msg.body || [msg.snippet || ""]).map(function(p){ return "<p>"+escapeHtml(p)+"</p>"; }).join("");
 }
+/* Attachments for one message, from GET /api/mails/{id} (or the
+   thread payload when the backend includes them). Each row downloads
+   through apiFetch so the admin-token header is sent — never a plain
+   <a href>, which could not authenticate. */
+function attachmentsHtml(msg){
+  var atts = msg.attachments || [];
+  if(!atts.length) return "";
+  var rows = atts.map(function(a){
+    var name = a.filename || a.name || "attachment";
+    var attId = a.attachmentId || a.attachment_id || a.id;
+    return '<button class="att-item" data-download-msg="'+escapeHtml(String(msg.id))+'" data-download-att="'+escapeHtml(String(attId))+'" data-download-name="'+escapeHtml(name)+'">'
+      + '<svg viewBox="0 0 24 24"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg>'
+      + '<span class="att-name">'+escapeHtml(name)+'</span>'
+      + '<span class="att-size">'+escapeHtml(formatBytes(a.size))+'</span></button>';
+  }).join("");
+  return '<div class="att-list"><h4>'+atts.length+' attachment'+(atts.length>1?"s":"")+'</h4>'+rows+'</div>'
+    + (msg._attachError ? '<div class="gm-error att-error" role="alert"><span>'+escapeHtml(msg._attachError)+'</span><button class="gm-retry" data-retry-attachments="'+escapeHtml(String(msg.id))+'">Retry</button></div>' : '');
+}
+async function downloadAttachment(mailId, attachmentId, filename){
+  try {
+    var res = await apiFetch("/api/mails/" + encodeURIComponent(mailId) + "/attachments/" + encodeURIComponent(attachmentId));
+    if(!res.ok) throw new Error("Download failed (" + res.status + ")");
+    var blob = await res.blob();
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement("a");
+    a.href = url;
+    a.download = filename || "attachment";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(function(){ URL.revokeObjectURL(url); }, 1000);
+  } catch(e){
+    toast("Couldn't download " + (filename || "attachment") + " — try again");
+    /* Visible, retryable error on the message itself as well. */
+    var msg = null;
+    threadMessages().forEach(function(x){ if(String(x.id) === String(mailId)) msg = x; });
+    if(msg){ msg._attachError = "Couldn't download " + (filename || "attachment"); renderReader(); }
+  }
+}
 function threadMessageHtml(msg, isLatest){
   var expanded = isLatest || !!msg._expanded;
   var head = '<div class="thread-msg-head">'
@@ -390,7 +530,7 @@ function threadMessageHtml(msg, isLatest){
   } else {
     bodyPart = '<div class="gm-body">'+messageBodyHtml(msg)+'</div>';
   }
-  return '<div class="thread-msg'+(isLatest?" latest":"")+'">'+head+bodyPart+'</div>';
+  return '<div class="thread-msg'+(isLatest?" latest":"")+'">'+head+bodyPart+attachmentsHtml(msg)+'</div>';
 }
 function recipientCount(msg){
   var n = 0;
@@ -417,6 +557,7 @@ async function loadThread(threadId){
   var seq = ++threadLoadSeq;
   THREAD_LOADING = true;
   THREAD_ERROR = null;
+  replyAttachments = [];
   renderReader();
   try {
     var res = await apiFetch("/api/threads/" + encodeURIComponent(threadId));
@@ -434,7 +575,7 @@ async function loadThread(threadId){
     var latest = latestThreadMessage();
     if(latest){
       fillMessageBody(latest, latest.body_text, latest.body_html);
-      if(!latest._fullLoaded) loadFullBody(latest);
+      if(!latest._fullLoaded || !latest.attachments) loadFullBody(latest);
     }
   } catch(e){
     if(seq !== threadLoadSeq) return;
@@ -450,7 +591,10 @@ async function loadThread(threadId){
 function renderReader(){
   var listEl=$("#gmailList"), readEl=$("#gmailRead"), box=$("#reader");
   var m = state.reading ? currentMail() : null;
-  if(!m || m.trashed || m.archived){
+  /* Archived/trashed rows can be read when the user is inside the
+     Archive/Trash/Spam folder itself — only bounce out of the reader
+     when such a row is opened from anywhere else. */
+  if(!m || ((m.trashed || m.archived) && !isStoredFolder(currentFolder()))){
     state.reading=false;
     THREAD=null; THREAD_ERROR=null; THREAD_LOADING=false;
     if(listEl) listEl.hidden=false;
@@ -459,6 +603,9 @@ function renderReader(){
   }
   if(listEl) listEl.hidden=true;
   if(readEl) readEl.hidden=false;
+  /* Restore is only offered inside Archive/Trash/Spam. */
+  var rstBtn=$("#gmReadRestore");
+  if(rstBtn) rstBtn.hidden = !isStoredFolder(currentFolder());
   var tkey = threadKey(m);
   var list=filteredMails();
   var idx=-1;
@@ -489,14 +636,20 @@ function renderReader(){
   }
   var latest = msgs[msgs.length-1];
   box.innerHTML =
-    '<div class="gm-subject-row"><h2>'+escapeHtml(latest.subject || m.subject)+'</h2><span class="gm-labelchip">Inbox</span><span class="gm-labelchip">'+escapeHtml(m.tag)+'</span>'+countBadge(m)+'</div>'
+    '<div class="gm-subject-row"><h2>'+escapeHtml(latest.subject || m.subject)+'</h2><span class="gm-labelchip">'+escapeHtml(folderLabel(currentFolder()))+'</span><span class="gm-labelchip">'+escapeHtml(m.tag)+'</span>'+countBadge(m)+'</div>'
     + '<div class="gm-ai"><h3><svg viewBox="0 0 24 24"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9Z"/></svg>AI summary</h3><p>'+escapeHtml(m.summary)+'</p></div>'
     + msgs.map(function(msg, i){ return threadMessageHtml(msg, i===msgs.length-1); }).join("")
     + '<div class="gm-reply-btns"><button class="gm-pill" id="gmReplyBtn">'+ICO.reply+'Reply</button>'
     + '<button class="gm-pill" id="gmForwardBtn">'+ICO.forward+'Forward</button></div>'
     + '<div class="gm-replybox" id="gmReplyBox" hidden>'
+    + '<div class="cc-row"><button class="gm-textbtn" type="button" id="rCcBccToggle" aria-expanded="false">Cc / Bcc</button></div>'
+    + '<input class="reply-ccbcc" id="rCc" type="text" placeholder="Cc" aria-label="Cc recipients" hidden />'
+    + '<input class="reply-ccbcc" id="rBcc" type="text" placeholder="Bcc" aria-label="Bcc recipients" hidden />'
     + (threadShowReplyAll() ? '<label class="gm-replyall"><input type="checkbox" id="replyAllCheck"> Reply all</label>' : '')
     + '<textarea id="replyText" placeholder="Reply to '+escapeHtml(latest.sender)+'…"></textarea>'
+    + '<div class="attach-row"><button class="gm-textbtn" type="button" id="rAttachBtn">Attach files</button><span class="attach-total" id="rAttachTotal"></span><input type="file" id="rAttachInput" multiple hidden /></div>'
+    + '<div id="rAttachList"></div>'
+    + '<div class="compose-note" id="rAttachError" hidden></div>'
     + '<div class="gm-reply-actions"><button class="gm-send" id="replyMailto">Send</button>'
     + '<button class="gm-textbtn" id="replyDraft">Draft with AI</button>'
     + '<button class="gm-textbtn" id="replyCopy">Copy text</button></div></div>';
@@ -504,15 +657,63 @@ function renderReader(){
     var rb=$("#gmReplyBox"); if(rb) rb.hidden=false;
     var rt=$("#replyText"); if(rt) rt.focus();
   }
+  var ccTog=$("#rCcBccToggle");
+  if(ccTog) ccTog.addEventListener("click",function(){
+    var cc=$("#rCc"), bcc=$("#rBcc");
+    var show = !cc || cc.hidden;
+    if(cc) cc.hidden = !show;
+    if(bcc) bcc.hidden = !show;
+    ccTog.setAttribute("aria-expanded", show ? "true" : "false");
+    if(show && cc) cc.focus();
+  });
+  var rAttBtn=$("#rAttachBtn"), rAttInput=$("#rAttachInput");
+  if(rAttBtn && rAttInput){
+    rAttBtn.addEventListener("click",function(){ rAttInput.click(); });
+    rAttInput.addEventListener("change",function(){
+      addAttachFiles(rAttInput.files, "reply");
+      rAttInput.value = "";
+    });
+  }
+  renderAttachList("reply");
   var rb1=$("#gmReplyBtn"); if(rb1) rb1.addEventListener("click",openReplyBox);
   var fw=$("#gmForwardBtn");
-  if(fw) fw.addEventListener("click",function(){
+  if(fw) fw.addEventListener("click",async function(){
     /* Forward opens the compose box prefilled (sent via the Gmail API
-       on submit), instead of a mailto: draft. */
+       on submit), instead of a mailto: draft. The original attachments
+       are re-attached from Gmail where they fit the 10 MB cap; any
+       that do not fit (or cannot be downloaded) are named in compose
+       instead of being silently dropped. */
     var to=$("#cTo"), sub=$("#cSubject"), bod=$("#cBody");
+    startFreshCompose();
     if(to) to.value="";
     if(sub) sub.value="Fwd: "+(latest.subject || m.subject);
     if(bod) bod.value="\n\n---------- Forwarded message ----------\nFrom: "+latest.sender+" <"+latest.email+">\nSubject: "+(latest.subject || m.subject)+"\n\n"+(latest._bodyText || latest.snippet || "");
+    forwardSkipped = [];
+    var atts = latest.attachments || [];
+    if(!atts.length && !latest._fullLoaded){
+      await loadFullBody(latest);
+      atts = latest.attachments || [];
+    }
+    for(var ai=0; ai<atts.length; ai++){
+      var a = atts[ai];
+      var aname = a.filename || a.name || "attachment";
+      var asize = Number(a.size) || 0;
+      var curTotal = composeAttachments.reduce(function(s,f){ return s + (f.size||0); }, 0);
+      if(asize && curTotal + asize > ATTACH_MAX_TOTAL){
+        forwardSkipped.push({ filename: aname, reason: "over size cap" });
+        continue;
+      }
+      try {
+        var r = await apiFetch("/api/mails/" + encodeURIComponent(latest.id) + "/attachments/" + encodeURIComponent(a.attachmentId || a.attachment_id || a.id));
+        if(!r.ok) throw new Error("download failed");
+        var blob = await r.blob();
+        composeAttachments.push(new File([blob], aname, { type: a.mimeType || blob.type || "application/octet-stream" }));
+      } catch(e){
+        forwardSkipped.push({ filename: aname, reason: "couldn't download" });
+      }
+    }
+    renderAttachList("compose");
+    showForwardNote();
     openCompose();
   });
   var draftBtn=$("#replyDraft");
@@ -527,9 +728,28 @@ function renderReader(){
     mailBtn.disabled=true; mailBtn.textContent="Sending…";
     try {
       var allBox=$("#replyAllCheck");
-      var res = await apiFetch("/api/threads/" + encodeURIComponent(String(tkey)) + "/reply", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ body: v, reply_all: !!(allBox && allBox.checked) }) });
+      var ccList = parseAddressList($("#rCc") ? $("#rCc").value : "");
+      var bccList = parseAddressList($("#rBcc") ? $("#rBcc").value : "");
+      var url = "/api/threads/" + encodeURIComponent(String(tkey)) + "/reply";
+      var res;
+      if(replyAttachments.length){
+        /* Attachments ride as FormData (cc/bcc as repeated fields);
+           JSON is used when there is nothing to upload. */
+        var fd = new FormData();
+        fd.append("body", v);
+        fd.append("reply_all", (allBox && allBox.checked) ? "true" : "false");
+        ccList.forEach(function(a){ fd.append("cc", a); });
+        bccList.forEach(function(a){ fd.append("bcc", a); });
+        replyAttachments.forEach(function(f){ fd.append("attachments", f, f.name); });
+        res = await apiFetch(url, { method: "POST", body: fd });
+      } else {
+        var payload = { body: v, reply_all: !!(allBox && allBox.checked) };
+        if(ccList.length) payload.cc = ccList;
+        if(bccList.length) payload.bcc = bccList;
+        res = await apiFetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+      }
       var d = await res.json().catch(function(){ return {}; });
-      if(res.ok){ toast("Reply sent"); var rb=$("#gmReplyBox"); if(rb) rb.hidden=true; var rt=$("#replyText"); if(rt) rt.value=""; loadThread(String(tkey)); }
+      if(res.ok){ toast("Reply sent"); replyAttachments=[]; var rb=$("#gmReplyBox"); if(rb) rb.hidden=true; var rt=$("#replyText"); if(rt) rt.value=""; loadThread(String(tkey)); }
       else { toast(d.detail || "Couldn't send the reply"); }
     } catch(e){ toast("Couldn't send the reply — check connection"); }
     finally { mailBtn.disabled=false; mailBtn.textContent="Send"; }
@@ -649,6 +869,11 @@ function currentFolder(){
   if(state.filter==="unread") return "unread";
   if(state.filter==="urgent") return "urgent";
   if(state.filter==="reply") return "reply";
+  if(state.filter==="sent") return "sent";
+  if(state.filter==="drafts") return "drafts";
+  if(state.filter==="archive") return "archive";
+  if(state.filter==="trash") return "trash";
+  if(state.filter==="spam") return "spam";
   return "inbox";
 }
 function resetPager(){
@@ -676,7 +901,88 @@ function buildMailsUrl(cursor){
   if(cursor) qs += "&cursor=" + encodeURIComponent(cursor);
   return "/api/mails?" + qs;
 }
+/* Drafts folder: server drafts (GET /api/drafts) carry the fields a
+   draft needs to be restored — to/cc/bcc/subject/body — which the
+   /api/mails thread rows do not, so the folder lists drafts directly
+   instead of going through /api/mails?folder=drafts. Rows are shaped
+   like mail rows so the pager, selection and empty state all work. */
+function draftRowFromDraft(d){
+  var id = d.id != null ? d.id : d.draft_id;
+  var body = d.body || "";
+  var when = d.updated_at || d.created_at || "";
+  var t = "";
+  try { t = when ? new Date(when).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : ""; } catch(e){}
+  return {
+    id: "draft:" + id,
+    draft_id: id,
+    _draft: d,
+    thread_id: "draft:" + id,
+    sender: "Draft",
+    email: addressListToString(d.to) || "",
+    subject: d.subject || "(No subject)",
+    snippet: body.replace(/\s+/g, " ").slice(0, 120),
+    body_text: body,
+    time: t,
+    tag: "Draft",
+    cat: "primary",
+    unread: false,
+    unread_count: 0,
+    starred: false,
+    archived: false,
+    trashed: false,
+    message_count: 1
+  };
+}
+async function fetchDraftsPage(cursor){
+  if(pager.loading){ pagePending = cursor; return "queued"; }
+  pager.loading = true;
+  renderGmailChrome();
+  var status = 0;
+  try {
+    var qs = "limit=" + PAGE_SIZE;
+    if(cursor) qs += "&cursor=" + encodeURIComponent(cursor);
+    var res = await apiFetch("/api/drafts?" + qs);
+    status = res.status;
+    var d = await res.json().catch(function(){ return {}; });
+    var list = null;
+    if(Array.isArray(d)) list = d;
+    else if(Array.isArray(d.drafts)) list = d.drafts;
+    else if(Array.isArray(d.mails)) list = d.mails;
+    if(!res.ok || (d.status && d.status !== "success") || list === null){
+      throw new Error((d && d.detail) || ("Couldn't load drafts (" + res.status + ")"));
+    }
+    MAILS = list.map(draftRowFromDraft);
+    SEARCH_RESULTS = null;
+    pager.nextCursor = d.next_cursor || null;
+    pager.hasMore = !!d.has_more;
+    pager.error = null;
+    inboxLoadError = null;
+    renderAll();
+    return true;
+  } catch(e){
+    if(status === 401 || status === 503){
+      pager.error = null;
+      inboxLoadError = null;
+      renderAll();
+      return false;
+    }
+    var msg = (e && e.message) || "Couldn't load drafts";
+    pager.error = msg;
+    inboxLoadError = msg;
+    toast(msg + " — try again");
+    renderLists();
+    return false;
+  } finally {
+    pager.loading = false;
+    renderGmailChrome();
+    if(pagePending !== null){ var c = pagePending; pagePending = null; fetchPage(c); }
+  }
+}
 async function fetchPage(cursor){
+  /* The Drafts folder lists server drafts, not mail threads (see
+     fetchDraftsPage) — except while searching, which goes through the
+     mail search path like every other folder. */
+  if(currentFolder() === "drafts" && !state.query.trim()) return fetchDraftsPage(cursor);
   /* While a page is loading, queue the newest request instead of
      racing it — the queue drains in order once the flight lands. */
   if(pager.loading){ pagePending = cursor; return "queued"; }
@@ -798,8 +1104,11 @@ async function loadFullBody(m){
   /* Fetch one message's real body (GET /api/mails/{id}) — used for the
      latest message when the thread payload has no body, and when an
      earlier message is expanded. A failure sets _bodyError, which the
-     reader renders as a visible error box with a Retry button. */
-  if(!m || m._fullLoading || m._fullLoaded) return;
+     reader renders as a visible error box with a Retry button. The
+     same fetch also carries the message's attachments, so a message
+     whose body is already known is still fetched once while its
+     attachments are unknown. */
+  if(!m || m._fullLoading || (m._fullLoaded && m.attachments)) return;
   m._fullLoading = true;
   m._bodyError = false;
   try {
@@ -809,6 +1118,9 @@ async function loadFullBody(m){
       fillMessageBody(m, d.mail.body_text, d.mail.body_html);
       if(!m._fullLoaded) m._bodyError = true;
       if(d.mail.label_ids) m.labels = d.mail.label_ids.join(",");
+      /* Attachments arrive with the full message (contract:
+         mail.attachments [{filename, mimeType, size, attachmentId}]). */
+      if(Array.isArray(d.mail.attachments)) m.attachments = d.mail.attachments;
     } else {
       m._bodyError = true;
     }
@@ -821,6 +1133,12 @@ async function loadFullBody(m){
 }
 function openMail(id){
   var row = rowByThreadKey(id);
+  /* A draft row opens in compose, restored from the server draft —
+     never in the thread reader. */
+  if(row && row.draft_id){
+    openDraft(row);
+    return;
+  }
   state.selectedId = id;
   state.reading = true;
   THREAD = null;
@@ -857,6 +1175,35 @@ function mailById(id){
 function rowAction(act, m){
   if(!m) return;
   var tk = threadKey(m);
+  /* Draft rows: Delete removes the server draft. No Gmail state call
+     applies to a draft. */
+  if(m.draft_id){
+    if(act === "trash"){
+      apiFetch("/api/drafts/" + encodeURIComponent(m.draft_id), { method: "DELETE" }).then(function(res){
+        if(!res.ok){ toast("Couldn't delete that draft"); return; }
+        var i = MAILS.indexOf(m); if(i > -1) MAILS.splice(i, 1);
+        delete state.selected[tk];
+        renderAll();
+        toast("Draft deleted");
+      }).catch(function(){ toast("Couldn't delete that draft — check connection"); });
+    }
+    return;
+  }
+  if(act==="restore"){
+    /* Un-trash / un-spam / un-archive via the existing thread state
+       endpoint (is_trash/is_spam/is_archived false). The row leaves
+       this folder only once Gmail accepts the change. */
+    var folder = currentFolder();
+    var payload = folder === "trash" ? { is_trash: false } : folder === "spam" ? { is_spam: false } : { is_archived: false };
+    threadStateToBackend(tk, payload).then(function(ok){
+      if(!ok) return;
+      var i = MAILS.indexOf(m); if(i > -1) MAILS.splice(i, 1);
+      if(String(threadKey(currentMail()))===String(tk)) state.reading=false;
+      delete state.selected[tk]; renderAll();
+      toast("Conversation restored to inbox");
+    });
+    return;
+  }
   if(act==="archive"){
     threadStateToBackend(tk, { is_archived: true }).then(function(ok){
       if(!ok) return;
@@ -900,6 +1247,33 @@ function rowAction(act, m){
   renderAll();
 }
 document.addEventListener("click",function(e){
+  var dl=e.target.closest ? e.target.closest("[data-download-att]") : null;
+  if(dl){
+    e.stopPropagation();
+    var btn = dl;
+    btn.disabled = true;
+    downloadAttachment(dl.getAttribute("data-download-msg"), dl.getAttribute("data-download-att"), dl.getAttribute("data-download-name")).finally(function(){ btn.disabled = false; });
+    return;
+  }
+  var ratt=e.target.closest ? e.target.closest("[data-retry-attachments]") : null;
+  if(ratt){
+    e.stopPropagation();
+    var rmid=ratt.getAttribute("data-retry-attachments");
+    var rmsg=null;
+    threadMessages().forEach(function(x){ if(String(x.id)===rmid) rmsg=x; });
+    if(rmsg){ rmsg._attachError=null; rmsg._fullLoaded=false; loadFullBody(rmsg); renderReader(); }
+    return;
+  }
+  var rmAtt=e.target.closest ? e.target.closest("[data-remove-att]") : null;
+  if(rmAtt){
+    e.stopPropagation();
+    var idx=parseInt(rmAtt.getAttribute("data-remove-att"), 10);
+    var which=rmAtt.getAttribute("data-att-list") || "compose";
+    if(which === "reply") replyAttachments.splice(idx, 1);
+    else { composeAttachments.splice(idx, 1); scheduleDraftAutosave(); }
+    renderAttachList(which);
+    return;
+  }
   var mstar=e.target.closest ? e.target.closest("[data-msg-star]") : null;
   if(mstar){
     /* Message-level star inside an expanded thread message (single-mail
@@ -933,7 +1307,7 @@ document.addEventListener("click",function(e){
     if(emsg){
       emsg._expanded=true;
       if(emsg.body_text || emsg.body_html) fillMessageBody(emsg, emsg.body_text, emsg.body_html);
-      else if(!emsg._fullLoaded && !emsg._fullLoading) loadFullBody(emsg);
+      if(!emsg._fullLoaded || !emsg.attachments) loadFullBody(emsg);
       renderReader();
     }
     return;
@@ -966,6 +1340,7 @@ document.addEventListener("click",function(e){
     e.stopPropagation();
     var tk=star.getAttribute("data-star");
     var row=rowByThreadKey(tk);
+    if(row && row.draft_id) return; /* Draft rows cannot be starred. */
     if(row){
       var next=!row.starred;
       threadStateToBackend(tk, { is_starred: next }).then(function(ok){
@@ -1046,10 +1421,39 @@ $("#searchInput").addEventListener("input",function(e){
   renderLists(); renderReader();
 });
 
-/* ================= Compose ================= */
+/* ================= Compose =================
+   Cc/Bcc, attachments (10 MB total cap), and server draft autosave
+   (POST /api/drafts, then PUT) all live here. The draft is saved
+   ~2s after typing stops and on close; an empty compose never creates
+   a draft, and closing an empty draft deletes the server draft. */
 function openCompose(){ $("#scrim").classList.add("open"); $("#composeModal").classList.add("open"); var to=$("#cTo"); if(to) to.focus(); }
-function closeCompose(){ $("#scrim").classList.remove("open"); $("#composeModal").classList.remove("open"); }
-$("#composeBtn").addEventListener("click",openCompose);
+function clearComposeFields(){
+  ["cTo","cCc","cBcc","cSubject","cBody"].forEach(function(id){ var el=$("#"+id); if(el) el.value=""; });
+  var cc=$("#cCc"), bcc=$("#cBcc");
+  if(cc) cc.hidden = true;
+  if(bcc) bcc.hidden = true;
+  var tog=$("#cCcBccToggle"); if(tog) tog.setAttribute("aria-expanded", "false");
+  var fn=$("#cForwardNote"); if(fn) fn.hidden = true;
+  var ae=$("#cAttachError"); if(ae) ae.hidden = true;
+}
+function startFreshCompose(){
+  currentDraftId = null;
+  composeAttachments = [];
+  forwardSkipped = [];
+  if(draftTimer){ clearTimeout(draftTimer); draftTimer = null; }
+  setDraftStatus("idle");
+  clearComposeFields();
+  renderAttachList("compose");
+  openCompose();
+}
+function closeCompose(){
+  /* Flush the autosave on close so nothing typed is lost; an empty
+     compose deletes its server draft instead of littering Drafts. */
+  saveDraft();
+  if(draftTimer){ clearTimeout(draftTimer); draftTimer = null; }
+  $("#scrim").classList.remove("open"); $("#composeModal").classList.remove("open");
+}
+$("#composeBtn").addEventListener("click",startFreshCompose);
 $("#composeClose").addEventListener("click",closeCompose);
 $("#scrim").addEventListener("click",function(){ closeCompose(); closeKeyModal(); });
 document.addEventListener("keydown",function(e){
@@ -1058,27 +1462,231 @@ document.addEventListener("keydown",function(e){
   $("#sidebar").classList.remove("open"); $("#navScrim").classList.remove("open");
   closeMenus();
 });
+/* Cc / Bcc toggle (Gmail-style, collapsed by default). */
+$("#cCcBccToggle").addEventListener("click",function(){
+  var cc=$("#cCc"), bcc=$("#cBcc");
+  var show = !cc || cc.hidden;
+  if(cc) cc.hidden = !show;
+  if(bcc) bcc.hidden = !show;
+  this.setAttribute("aria-expanded", show ? "true" : "false");
+  if(show && cc) cc.focus();
+});
+/* ---- Attachments (compose + reply share these) ---- */
+function attachTotal(list){ return list.reduce(function(s,f){ return s + (f.size || 0); }, 0); }
+function addAttachFiles(fileList, which){
+  var list = (which === "reply") ? replyAttachments : composeAttachments;
+  var errEl = (which === "reply") ? $("#rAttachError") : $("#cAttachError");
+  var refused = [];
+  for(var i=0;i<fileList.length;i++){
+    var f = fileList[i];
+    if(attachTotal(list) + (f.size || 0) > ATTACH_MAX_TOTAL) refused.push(f.name);
+    else list.push(f);
+  }
+  if(refused.length && errEl){
+    errEl.textContent = "Couldn't attach " + refused.join(", ") + " — the total would pass 10 MB (" + formatBytes(attachTotal(list)) + " attached). Remove a file to make room.";
+    errEl.hidden = false;
+  } else if(errEl){
+    errEl.hidden = true;
+  }
+  renderAttachList(which);
+}
+function renderAttachList(which){
+  var list = (which === "reply") ? replyAttachments : composeAttachments;
+  var listEl = (which === "reply") ? $("#rAttachList") : $("#cAttachList");
+  var totalEl = (which === "reply") ? $("#rAttachTotal") : $("#cAttachTotal");
+  if(totalEl) totalEl.textContent = list.length ? list.length + " file" + (list.length > 1 ? "s" : "") + ", " + formatBytes(attachTotal(list)) + " of 10 MB" : "";
+  if(!listEl) return;
+  listEl.innerHTML = list.map(function(f, i){
+    return '<div class="attach-item"><span class="att-name">' + escapeHtml(f.name) + '</span><span class="att-size">' + escapeHtml(formatBytes(f.size)) + '</span><button type="button" data-remove-att="' + i + '" data-att-list="' + which + '" aria-label="Remove attachment">Remove</button></div>';
+  }).join("");
+}
+var cAttBtn=$("#cAttachBtn"), cAttInput=$("#cAttachInput");
+if(cAttBtn && cAttInput){
+  cAttBtn.addEventListener("click",function(){ cAttInput.click(); });
+  cAttInput.addEventListener("change",function(){
+    addAttachFiles(cAttInput.files, "compose");
+    cAttInput.value = "";
+    scheduleDraftAutosave();
+  });
+}
+function showForwardNote(){
+  var fn=$("#cForwardNote");
+  if(!fn) return;
+  if(!forwardSkipped.length){ fn.hidden = true; return; }
+  fn.textContent = forwardSkipped.length + " attachment" + (forwardSkipped.length > 1 ? "s" : "") + " could not be re-attached: "
+    + forwardSkipped.map(function(s){ return s.filename + " (" + s.reason + ")"; }).join(", ") + ".";
+  fn.hidden = false;
+}
+/* ---- Draft autosave ---- */
+function composeDraftPayload(){
+  return {
+    to: $("#cTo") ? $("#cTo").value.trim() : "",
+    cc: parseAddressList($("#cCc") ? $("#cCc").value : ""),
+    bcc: parseAddressList($("#cBcc") ? $("#cBcc").value : ""),
+    subject: $("#cSubject") ? $("#cSubject").value.trim() : "",
+    body: $("#cBody") ? $("#cBody").value : ""
+  };
+}
+function composeIsEmpty(){
+  var p = composeDraftPayload();
+  return !p.to && !p.cc.length && !p.bcc.length && !p.subject && !p.body.trim() && !composeAttachments.length;
+}
+function setDraftStatus(state, when){
+  draftSaveState = state;
+  var el = $("#cDraftStatus");
+  if(!el) return;
+  el.classList.remove("error");
+  if(state === "saving"){ el.hidden = false; el.textContent = "Saving…"; }
+  else if(state === "saved"){ el.hidden = false; el.textContent = "Draft saved " + (when || formatClock(new Date())); }
+  else if(state === "error"){ el.hidden = false; el.textContent = "Couldn't save draft — retry"; el.classList.add("error"); }
+  else { el.hidden = true; el.textContent = ""; }
+}
+var cDraftStatusEl=$("#cDraftStatus");
+if(cDraftStatusEl) cDraftStatusEl.addEventListener("click",function(){ if(draftSaveState === "error") saveDraft(); });
+function deleteDraft(id){
+  if(id == null) return Promise.resolve(false);
+  return apiFetch("/api/drafts/" + encodeURIComponent(id), { method: "DELETE" }).then(function(res){ return res.ok; }).catch(function(){ return false; });
+}
+async function saveDraft(){
+  if(draftSaveState === "saving") return false;
+  /* An empty compose never creates a draft; closing one deletes the
+     server draft instead of leaving an empty row in Drafts. */
+  if(composeIsEmpty()){
+    if(currentDraftId != null){
+      var oldId = currentDraftId;
+      currentDraftId = null;
+      await deleteDraft(oldId);
+    }
+    setDraftStatus("idle");
+    return true;
+  }
+  setDraftStatus("saving");
+  try {
+    var payload = composeDraftPayload();
+    var res, d;
+    if(currentDraftId != null){
+      res = await apiFetch("/api/drafts/" + encodeURIComponent(currentDraftId), { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+      d = await res.json().catch(function(){ return {}; });
+    } else {
+      res = await apiFetch("/api/drafts", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+      d = await res.json().catch(function(){ return {}; });
+      if(res.ok){
+        var nid = (d.draft && d.draft.id != null) ? d.draft.id : (d.id != null ? d.id : d.draft_id);
+        if(nid != null) currentDraftId = nid;
+      }
+    }
+    if(!res.ok) throw new Error((d && d.detail) || "save failed");
+    setDraftStatus("saved");
+    renderFolderBadges();
+    return true;
+  } catch(e){
+    setDraftStatus("error");
+    return false;
+  }
+}
+function scheduleDraftAutosave(){
+  if(draftTimer) clearTimeout(draftTimer);
+  draftTimer = setTimeout(function(){ draftTimer = null; saveDraft(); }, 2000);
+}
+["cTo","cCc","cBcc","cSubject","cBody"].forEach(function(id){
+  var el = document.getElementById(id);
+  if(el) el.addEventListener("input", scheduleDraftAutosave);
+});
+/* Reopen a server draft in compose, with cc/bcc/subject/body and any
+   attachments note the draft carries. Files themselves cannot be
+   restored from the server draft — the note says so plainly. */
+function openDraft(row){
+  var d = row._draft || {};
+  startFreshCompose();
+  currentDraftId = row.draft_id;
+  var to=$("#cTo"), cc=$("#cCc"), bcc=$("#cBcc"), sub=$("#cSubject"), bod=$("#cBody");
+  if(to) to.value = addressListToString(d.to) || d.to || "";
+  var ccList = parseAddressList(d.cc), bccList = parseAddressList(d.bcc);
+  if(cc && ccList.length){ cc.value = ccList.join(", "); cc.hidden = false; }
+  if(bcc && bccList.length){ bcc.value = bccList.join(", "); bcc.hidden = false; }
+  if(ccList.length || bccList.length){ var tog=$("#cCcBccToggle"); if(tog) tog.setAttribute("aria-expanded", "true"); }
+  if(sub) sub.value = d.subject || "";
+  if(bod) bod.value = d.body || "";
+  var fn=$("#cForwardNote");
+  var note = d.attachments_note || d.attachmentsNote || "";
+  if(!note && Array.isArray(d.attachments) && d.attachments.length){
+    note = "This draft had " + d.attachments.length + " attachment" + (d.attachments.length > 1 ? "s" : "") + " saved with it — re-attach the files before sending.";
+  }
+  if(fn && note){ fn.textContent = note; fn.hidden = false; }
+  setDraftStatus("saved", formatClock(d.updated_at || d.created_at || new Date()));
+}
+var composeSending = false;
 $("#composeForm").addEventListener("submit",async function(e){
   e.preventDefault();
+  if(composeSending) return;
   var to=$("#cTo").value.trim(), sub=$("#cSubject").value.trim(), body=$("#cBody").value;
   if(!to){ toast("Add a recipient first"); return; }
   if(!sub){ toast("Add a subject first"); return; }
   if(!body.trim()){ toast("Write your message first"); return; }
+  var ccList = parseAddressList($("#cCc") ? $("#cCc").value : "");
+  var bccList = parseAddressList($("#cBcc") ? $("#cBcc").value : "");
+  composeSending = true;
   try {
-    var res = await apiFetch("/api/mails/send", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ to: to, subject: sub, body: body }) });
+    var res;
+    if(composeAttachments.length){
+      /* Attachments ride as FormData (cc/bcc as repeated fields);
+         JSON is used when there is nothing to upload. */
+      var fd = new FormData();
+      fd.append("to", to);
+      fd.append("subject", sub);
+      fd.append("body", body);
+      ccList.forEach(function(a){ fd.append("cc", a); });
+      bccList.forEach(function(a){ fd.append("bcc", a); });
+      composeAttachments.forEach(function(f){ fd.append("attachments", f, f.name); });
+      res = await apiFetch("/api/mails/send", { method: "POST", body: fd });
+    } else {
+      var payload = { to: to, subject: sub, body: body };
+      if(ccList.length) payload.cc = ccList;
+      if(bccList.length) payload.bcc = bccList;
+      res = await apiFetch("/api/mails/send", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+    }
     var d = await res.json().catch(function(){ return {}; });
     if(res.ok){
-      toast("Sent");
-      $("#cTo").value=""; $("#cSubject").value=""; $("#cBody").value="";
+      /* The server may report attachments it could not re-attach on
+         a forward (skipped_attachments); surface that with the send
+         result instead of dropping it silently. */
+      var skipped = d.skipped_attachments || d.skipped || [];
+      var skippedCount = Array.isArray(skipped) ? skipped.length : (Number(skipped) || 0);
+      if(currentDraftId != null){ var sentDraftId = currentDraftId; currentDraftId = null; await deleteDraft(sentDraftId); }
+      composeAttachments = [];
+      forwardSkipped = [];
+      clearComposeFields();
+      renderAttachList("compose");
+      setDraftStatus("idle");
       closeCompose();
+      if(skippedCount){
+        var names = Array.isArray(skipped) ? skipped.map(function(s){ return (s && s.filename) || s; }).join(", ") : "";
+        toast("Sent — " + skippedCount + " attachment" + (skippedCount > 1 ? "s" : "") + " could not be re-attached" + (names ? ": " + names : ""));
+      } else {
+        toast("Sent");
+      }
+      /* A sent draft leaves the Drafts folder; refresh it if open. */
+      if(currentFolder() === "drafts"){ resetPager(); fetchPage(null); }
+      else renderFolderBadges();
     } else {
-      /* Keep the draft open so nothing is lost; Copy draft still works. */
+      /* Keep the draft open so nothing is lost, and make sure the
+         failed send is persisted as a server draft. */
       toast(d.detail || "Couldn't send the email");
+      await saveDraft();
     }
-  } catch(err){ toast("Couldn't send the email — check connection"); }
+  } catch(err){
+    toast("Couldn't send the email — check connection");
+    await saveDraft();
+  } finally {
+    composeSending = false;
+  }
 });
 $("#copyDraft").addEventListener("click",function(){
   var txt="To: "+$("#cTo").value+"\nSubject: "+$("#cSubject").value+"\n\n"+$("#cBody").value;
+  var ccV=$("#cCc") ? $("#cCc").value.trim() : "";
+  var bccV=$("#cBcc") ? $("#cBcc").value.trim() : "";
+  if(ccV) txt="To: "+$("#cTo").value+"\nCc: "+ccV+"\nSubject: "+$("#cSubject").value+"\n\n"+$("#cBody").value;
+  if(bccV) txt="To: "+$("#cTo").value+(ccV?"\nCc: "+ccV:"")+"\nBcc: "+bccV+"\nSubject: "+$("#cSubject").value+"\n\n"+$("#cBody").value;
   if(navigator.clipboard) navigator.clipboard.writeText(txt);
   toast("Draft copied");
 });
@@ -1309,6 +1917,38 @@ $$("#gmBarSel [data-selact]").forEach(function(b){
     if(!ids.length) return;
     if(act==="snooze"){ toast("Snooze isn\u2019t available yet \u2014 these mails stay in your inbox"); state.selected={}; renderAll(); return; }
     if(act==="label"){ openLabelMenu(b, ids); return; }
+    /* Drafts folder: Delete removes the server drafts, one call each. */
+    if(currentFolder() === "drafts" && act === "trash"){
+      var drafts = ids.map(function(tk){ return rowByThreadKey(tk); }).filter(function(m){ return m && m.draft_id; });
+      var done = 0;
+      (async function(){
+        for(var di=0; di<drafts.length; di++){
+          try {
+            var r = await apiFetch("/api/drafts/" + encodeURIComponent(drafts[di].draft_id), { method: "DELETE" });
+            if(r.ok){ done++; var i = MAILS.indexOf(drafts[di]); if(i > -1) MAILS.splice(i, 1); }
+          } catch(e){}
+        }
+        state.selected = {};
+        renderAll();
+        toast(done ? ("Deleted " + done + " draft" + (done > 1 ? "s" : "")) : "Couldn't delete those drafts");
+      })();
+      return;
+    }
+    if(act==="restore"){
+      var folder = currentFolder();
+      var rpayload = folder === "trash" ? { is_trash: false } : folder === "spam" ? { is_spam: false } : { is_archived: false };
+      threadBulkState(ids, rpayload).then(function(okIds){
+        if(!okIds.length){ toast("Couldn't sync that change with Gmail"); return; }
+        okIds.forEach(function(tk){
+          var m=rowByThreadKey(tk); if(!m) return;
+          var i = MAILS.indexOf(m); if(i > -1) MAILS.splice(i, 1);
+        });
+        state.selected={};
+        renderAll();
+        toast(okIds.length===ids.length ? "Conversations restored to inbox" : "Restored "+okIds.length+" of "+ids.length+" — Gmail didn't accept the rest");
+      });
+      return;
+    }
     var payload = act==="archive" ? { is_archived: true } : act==="trash" ? { is_trash: true } : act==="spam" ? { is_spam: true } : { is_unread: false };
     /* Thread state is applied per thread (no bulk thread endpoint);
        local state flips only for the threads Gmail accepted. */
@@ -1331,6 +1971,7 @@ $$("#gmBarSel [data-selact]").forEach(function(b){
 $("#gmBack").addEventListener("click",function(){ state.reading=false; renderAll(); });
 function currentAction(act){ rowAction(act, currentMail()); }
 $("#gmReadArchive").addEventListener("click",function(){ currentAction("archive"); });
+$("#gmReadRestore").addEventListener("click",function(){ currentAction("restore"); });
 $("#gmReadTrash").addEventListener("click",function(){ currentAction("trash"); });
 $("#gmReadSpam").addEventListener("click",function(){ currentAction("spam"); });
 $("#gmReadSnooze").addEventListener("click",function(){ toast("Snooze isn\u2019t available yet \u2014 this mail stays in your inbox"); state.reading=false; renderAll(); });
@@ -1377,6 +2018,11 @@ async function initBackend(){
        provides them (renderStats prefers these over local counts). */
     if(data.inbox_counts) INBOX_COUNTS = data.inbox_counts;
     else if(data.data && data.data.inbox_counts) INBOX_COUNTS = data.data.inbox_counts;
+    /* Per-folder counts for the sidebar badges, when the backend
+       provides them (also accepted nested under inbox_counts). */
+    var fc = data.folder_counts || (data.data && data.data.folder_counts)
+      || (INBOX_COUNTS && INBOX_COUNTS.folder_counts);
+    if(fc) FOLDER_COUNTS = fc;
     if(data.status === "success" || data.status === "warning"){
       var cfg = data.config || {};
       if(cfg.model){

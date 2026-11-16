@@ -265,11 +265,19 @@ def api_client(monkeypatch, thread_rows, thread_messages):
         calls["gmail_state"].append(dict(kw))
         return True
 
-    def _reply(mid, body, reply_all=False):
+    def _reply(mid, body, reply_all=False, cc_addrs=None, bcc_addrs=None,
+               attachments=None):
+        # Phase 2: the reply endpoints now pass cc_addrs/bcc_addrs/
+        # attachments through to reply_to_email; the fake must accept
+        # them (it still records the (mid, body, reply_all) triple the
+        # Phase 1 assertions check).
         calls["reply"].append((mid, body, reply_all))
         return "sent999"
 
-    def _send(to, subject, body):
+    def _send(to, subject, body, cc_addrs=None, bcc_addrs=None,
+              attachments=None):
+        # Phase 2: compose_and_send now passes cc_addrs/bcc_addrs/
+        # attachments through to send_email; same recording contract.
         calls["send"].append((to, subject, body))
         return "sent888"
 
@@ -452,13 +460,24 @@ class TestListThreadsSQL:
                               "inbox", None, None)
 
     def test_starred_excludes_trashed_sql(self, monkeypatch):
+        # Phase 2: folder state comes from the stored Gmail labels CSV,
+        # not the is_starred / is_trashed flags. Same semantics: STARRED
+        # present, TRASH absent (archived mail stays visible, like Gmail).
         fake, _, _, _ = self._run(monkeypatch, folder="starred")
-        assert "p.is_starred = TRUE AND p.is_trashed = FALSE" in fake.sql
+        assert "FIND_IN_SET('STARRED', COALESCE(p.labels, '')) > 0" in fake.sql
+        assert "FIND_IN_SET('TRASH', COALESCE(p.labels, '')) = 0" in fake.sql
+        assert "p.is_starred" not in fake.sql and "p.is_trashed" not in fake.sql
 
     def test_unread_excludes_archived_and_trashed_sql(self, monkeypatch):
+        # Phase 2: unread = UNREAD label present AND in the inbox
+        # (INBOX present, TRASH/SPAM absent). The old flag SQL
+        # (is_unread / is_archived / is_trashed) is gone.
         fake, _, _, _ = self._run(monkeypatch, folder="unread")
-        assert ("p.is_unread = TRUE AND p.is_archived = FALSE "
-                "AND p.is_trashed = FALSE") in fake.sql
+        assert "FIND_IN_SET('UNREAD', COALESCE(p.labels, '')) > 0" in fake.sql
+        assert "FIND_IN_SET('INBOX', COALESCE(p.labels, '')) > 0" in fake.sql
+        assert "FIND_IN_SET('TRASH', COALESCE(p.labels, '')) = 0" in fake.sql
+        assert "FIND_IN_SET('SPAM', COALESCE(p.labels, '')) = 0" in fake.sql
+        assert "p.is_unread" not in fake.sql and "p.is_archived" not in fake.sql
 
     def test_primary_uses_coalesce_for_null_labels(self, monkeypatch):
         fake, _, _, _ = self._run(monkeypatch, folder="inbox", cat="primary")

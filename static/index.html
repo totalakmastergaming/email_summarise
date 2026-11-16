@@ -55,10 +55,43 @@
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2.5l2.9 6 6.6.9-4.8 4.6 1.2 6.5L12 17.4l-5.9 3.1 1.2-6.5L2.5 9.4l6.6-.9Z"/></svg>
         Starred
       </button>
+      <button class="nav-item" data-filter-jump="unread">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="m22 7-10 6L2 7"/></svg>
+        Unread
+      </button>
       <button class="nav-item" data-filter-jump="urgent">
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>
         Urgent
         <span class="count hot" id="navUrgent">0</span>
+      </button>
+      <button class="nav-item" data-filter-jump="reply">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 17-5-5 5-5"/><path d="M20 18v-2a4 4 0 0 0-4-4H4"/></svg>
+        Awaiting reply
+      </button>
+      <button class="nav-item" data-filter-jump="sent">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2 11 13"/><path d="M22 2 15 22l-4-9-9-4Z"/></svg>
+        Sent
+        <span class="count" id="navSent" hidden>0</span>
+      </button>
+      <button class="nav-item" data-filter-jump="drafts">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.8 2.8 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/></svg>
+        Drafts
+        <span class="count" id="navDrafts" hidden>0</span>
+      </button>
+      <button class="nav-item" data-filter-jump="archive">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.54 5.23l-1.39-1.68C18.88 3.21 18.47 3 18 3H6c-.47 0-.88.21-1.15.55L3.46 5.23C3.17 5.57 3 6.02 3 6.5V19c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V6.5c0-.48-.17-.93-.46-1.27zM12 17.5 6.5 12H10v-2h4v2h3.5L12 17.5zM19 5H5v-.5l1-1h12l1 1V5z"/></svg>
+        Archive
+        <span class="count" id="navArchive" hidden>0</span>
+      </button>
+      <button class="nav-item" data-filter-jump="trash">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/></svg>
+        Trash
+        <span class="count" id="navTrash" hidden>0</span>
+      </button>
+      <button class="nav-item" data-filter-jump="spam">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 12l-2.44-2.78.34-3.68-3.61-.82-1.89-3.18L12 3 9.81 5.54 7.92 8.72l-3.61.81.34 3.68L2 12l2.44 2.78-.34 3.69 3.61.82 1.89 3.18L12 21l2.19-2.54 1.89-3.18 3.61-.82-.34-3.68L23 12zm-12.9 4.73H9.1v-2h1.99v2zm2-3.07H9.1V6.34h2.98v7.32z"/></svg>
+        Spam
+        <span class="count" id="navSpam" hidden>0</span>
       </button>
     </nav>
     <div class="sidebar-foot">
@@ -213,6 +246,7 @@
               <button class="gm-tbtn" data-selact="archive" aria-label="Archive"><svg viewBox="0 0 24 24"><path d="M20.54 5.23l-1.39-1.68C18.88 3.21 18.47 3 18 3H6c-.47 0-.88.21-1.15.55L3.46 5.23C3.17 5.57 3 6.02 3 6.5V19c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V6.5c0-.48-.17-.93-.46-1.27zM12 17.5 6.5 12H10v-2h4v2h3.5L12 17.5zM19 5H5v-.5l1-1h12l1 1V5z"/></svg></button>
               <button class="gm-tbtn" data-selact="spam" aria-label="Report spam"><svg viewBox="0 0 24 24"><path d="M23 12l-2.44-2.78.34-3.68-3.61-.82-1.89-3.18L12 3 9.81 5.54 7.92 8.72l-3.61.81.34 3.68L2 12l2.44 2.78-.34 3.69 3.61.82 1.89 3.18L12 21l2.19-2.54 1.89-3.18 3.61-.82-.34-3.68L23 12zm-12.9 4.73H9.1v-2h1.99v2zm2-3.07H9.1V6.34h2.98v7.32z"/></svg></button>
               <button class="gm-tbtn" data-selact="trash" aria-label="Delete"><svg viewBox="0 0 24 24"><path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/></svg></button>
+              <button class="gm-tbtn" data-selact="restore" aria-label="Restore to inbox"><svg viewBox="0 0 24 24"><path d="M12.5 8c-2.65 0-5.05.99-6.9 2.6L2 7v9h9l-3.62-3.62c1.39-1.16 3.16-1.88 5.12-1.88 3.54 0 6.55 2.31 7.6 5.5l2.37-.78C21.08 11.03 17.15 8 12.5 8z"/></svg></button>
               <span class="gm-sep"></span>
               <button class="gm-tbtn" data-selact="read" aria-label="Mark as read"><svg viewBox="0 0 24 24"><path d="M21.99 8c0-.72-.37-1.35-.94-1.7L12 1 2.95 6.3C2.38 6.65 2 7.28 2 8v10c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8zM12 13 3.74 7.84 12 3l8.26 4.84L12 13z"/></svg></button>
               <button class="gm-tbtn" data-selact="snooze" aria-label="Snooze"><svg viewBox="0 0 24 24"><path d="M11.99 2C6.47 2 2 6.48 2 12s4.47 10 9.99 10C17.52 22 22 17.52 22 12S17.52 2 11.99 2zM12 20c-4.42 0-8-3.58-8-8s3.58-8 8-8 8 3.58 8 8-3.58 8-8 8zm.5-13H11v6l5.25 3.15.75-1.23-4.5-2.67V7z"/></svg></button>
@@ -227,6 +261,8 @@
               <button class="gm-tab active" data-cat="primary"><svg viewBox="0 0 24 24"><path d="M19 3H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm0 12h-4c0 1.66-1.34 3-3 3s-3-1.34-3-3H5V5h14v10z"/></svg><span class="gm-tab-name">Primary</span></button>
               <button class="gm-tab" data-cat="social"><svg viewBox="0 0 24 24"><path d="M16 11c1.66 0 2.99-1.34 2.99-3S17.66 5 16 5c-1.66 0-3 1.34-3 3s1.34 3 3 3zm-8 0c1.66 0 2.99-1.34 2.99-3S9.66 5 8 5C6.34 5 5 6.34 5 8s1.34 3 3 3zm0 2c-2.33 0-7 1.17-7 3.5V19h14v-2.5c0-2.33-4.67-3.5-7-3.5zm8 0c-.29 0-.62.02-.97.05 1.16.84 1.97 1.97 1.97 3.45V19h6v-2.5c0-2.33-4.67-3.5-7-3.5z"/></svg><span class="gm-tab-name">Social</span><span class="gm-new social" id="gmNewSocial" hidden></span></button>
               <button class="gm-tab" data-cat="promotions"><svg viewBox="0 0 24 24"><path d="M21.41 11.58l-9-9C12.05 2.22 11.55 2 11 2H4c-1.1 0-2 .9-2 2v7c0 .55.22 1.05.59 1.42l9 9c.36.36.86.58 1.41.58.55 0 1.05-.22 1.41-.59l7-7c.37-.36.59-.86.59-1.41 0-.55-.23-1.06-.59-1.42zM5.5 7C4.67 7 4 6.33 4 5.5S4.67 4 5.5 4 7 4.67 7 5.5 6.33 7 5.5 7z"/></svg><span class="gm-tab-name">Promotions</span><span class="gm-new promo" id="gmNewPromo" hidden></span></button>
+              <button class="gm-tab" data-cat="updates"><svg viewBox="0 0 24 24"><path d="M19 3h-4.18C14.4 1.84 13.3 1 12 1c-1.3 0-2.4.84-2.82 2H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm-7 0c.55 0 1 .45 1 1s-.45 1-1 1-1-.45-1-1 .45-1 1-1zm-2 14l-4-4 1.41-1.41L10 14.17l6.59-6.59L18 9l-8 8z"/></svg><span class="gm-tab-name">Updates</span><span class="gm-new updates" id="gmNewUpdates" hidden></span></button>
+              <button class="gm-tab" data-cat="forums"><svg viewBox="0 0 24 24"><path d="M16 11c1.66 0 2.99-1.34 2.99-3S17.66 5 16 5c-1.66 0-3 1.34-3 3s1.34 3 3 3zm-8 0c1.66 0 2.99-1.34 2.99-3S9.66 5 8 5C6.34 5 5 6.34 5 8s1.34 3 3 3zm0 2c-2.33 0-7 1.17-7 3.5V19h14v-2.5c0-2.33-4.67-3.5-7-3.5zm8 0c-.29 0-.62.02-.97.05 1.16.84 1.97 1.97 1.97 3.45V19h6v-2.5c0-2.33-4.67-3.5-7-3.5z"/></svg><span class="gm-tab-name">Forums</span><span class="gm-new forums" id="gmNewForums" hidden></span></button>
             </div>
             <div class="gm-filterbar" id="gmFilterBar" hidden>
               <span id="gmFilterText"></span>
@@ -245,6 +281,7 @@
               <button class="gm-tbtn" id="gmReadArchive" aria-label="Archive"><svg viewBox="0 0 24 24"><path d="M20.54 5.23l-1.39-1.68C18.88 3.21 18.47 3 18 3H6c-.47 0-.88.21-1.15.55L3.46 5.23C3.17 5.57 3 6.02 3 6.5V19c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V6.5c0-.48-.17-.93-.46-1.27zM12 17.5 6.5 12H10v-2h4v2h3.5L12 17.5zM19 5H5v-.5l1-1h12l1 1V5z"/></svg></button>
               <button class="gm-tbtn" id="gmReadSpam" aria-label="Report spam"><svg viewBox="0 0 24 24"><path d="M23 12l-2.44-2.78.34-3.68-3.61-.82-1.89-3.18L12 3 9.81 5.54 7.92 8.72l-3.61.81.34 3.68L2 12l2.44 2.78-.34 3.69 3.61.82 1.89 3.18L12 21l2.19-2.54 1.89-3.18 3.61-.82-.34-3.68L23 12zm-12.9 4.73H9.1v-2h1.99v2zm2-3.07H9.1V6.34h2.98v7.32z"/></svg></button>
               <button class="gm-tbtn" id="gmReadTrash" aria-label="Delete"><svg viewBox="0 0 24 24"><path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"/></svg></button>
+              <button class="gm-tbtn" id="gmReadRestore" aria-label="Restore to inbox" hidden><svg viewBox="0 0 24 24"><path d="M12.5 8c-2.65 0-5.05.99-6.9 2.6L2 7v9h9l-3.62-3.62c1.39-1.16 3.16-1.88 5.12-1.88 3.54 0 6.55 2.31 7.6 5.5l2.37-.78C21.08 11.03 17.15 8 12.5 8z"/></svg></button>
               <span class="gm-sep"></span>
               <button class="gm-tbtn" id="gmReadUnread" aria-label="Mark as unread"><svg viewBox="0 0 24 24"><path d="M20 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm0 4-8 5-8-5V6l8 5 8-5v2z"/></svg></button>
               <button class="gm-tbtn" id="gmReadSnooze" aria-label="Snooze"><svg viewBox="0 0 24 24"><path d="M11.99 2C6.47 2 2 6.48 2 12s4.47 10 9.99 10C17.52 22 22 17.52 22 12S17.52 2 11.99 2zM12 20c-4.42 0-8-3.58-8-8s3.58-8 8-8 8 3.58 8 8-3.58 8-8 8zm.5-13H11v6l5.25 3.15.75-1.23-4.5-2.67V7z"/></svg></button>
@@ -528,9 +565,23 @@
     </button>
   </div>
   <form id="composeForm">
+    <div class="cc-row">
+      <button class="gm-textbtn" type="button" id="cCcBccToggle" aria-expanded="false">Cc / Bcc</button>
+      <span class="draft-status" id="cDraftStatus" hidden></span>
+    </div>
     <input id="cTo" type="email" placeholder="To" autocomplete="off" aria-label="Recipient" />
+    <input id="cCc" type="text" placeholder="Cc" autocomplete="off" aria-label="Cc recipients" hidden />
+    <input id="cBcc" type="text" placeholder="Bcc" autocomplete="off" aria-label="Bcc recipients" hidden />
     <input id="cSubject" type="text" placeholder="Subject" autocomplete="off" aria-label="Subject" />
     <textarea id="cBody" placeholder="Write your message…" aria-label="Message"></textarea>
+    <div class="attach-row">
+      <button class="btn" type="button" id="cAttachBtn">Attach files</button>
+      <span class="attach-total" id="cAttachTotal"></span>
+      <input type="file" id="cAttachInput" multiple hidden />
+    </div>
+    <div id="cAttachList"></div>
+    <div class="compose-note" id="cAttachError" hidden></div>
+    <div class="compose-note" id="cForwardNote" hidden></div>
     <div style="display:flex;gap:8px;flex-wrap:wrap">
       <button class="btn primary" type="submit">Send</button>
       <button class="btn" type="button" id="copyDraft">Copy draft</button>

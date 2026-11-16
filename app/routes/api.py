@@ -4,7 +4,8 @@ import logging
 from datetime import datetime
 from typing import Optional, Any
 from zoneinfo import ZoneInfo
-from fastapi import APIRouter, Depends, Header, HTTPException, status, Path
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, status, Path
+from starlette.datastructures import UploadFile
 from pydantic import BaseModel
 
 from app.config import settings
@@ -19,6 +20,12 @@ from app.database import (
     get_thread_messages,
     list_threads,
     get_sync_checkpoint,
+    get_folder_counts,
+    create_draft,
+    get_draft,
+    list_drafts,
+    update_draft,
+    delete_draft,
     get_system_config,
     set_system_config,
     get_api_keys,
@@ -33,8 +40,13 @@ from app.database import (
 from app.services.history_sync import run_incremental_sync, maybe_trigger_background_sync
 from app.cache import dashboard_cache, assistant_cache, invalidate_inbox_caches
 from app.services.gmail_service import (
+    MAX_ATTACHMENT_BYTES,
     fetch_recent_emails,
     get_email_full,
+    get_message_attachments,
+    get_attachment_bytes,
+    build_forward_draft,
+    fetch_forward_attachments,
     update_gmail_message_state,
     batch_update_message_states,
     list_user_labels,
@@ -118,17 +130,48 @@ class LabelRequest(BaseModel):
 
 class ReplyRequest(BaseModel):
     body: str
+    cc: list[str] = []
+    bcc: list[str] = []
 
 
 class ThreadReplyRequest(BaseModel):
     body: str
     reply_all: bool = False
+    cc: list[str] = []
+    bcc: list[str] = []
 
 
 class SendRequest(BaseModel):
     to: str
     subject: str
     body: str
+    cc: list[str] = []
+    bcc: list[str] = []
+    # Forward: re-attach originals from this message. When
+    # forward_attachment_ids is empty, ALL of the original's
+    # attachments are re-attached (within the 10 MB total cap).
+    forward_message_id: Optional[str] = None
+    forward_attachment_ids: list[str] = []
+
+
+class DraftCreateRequest(BaseModel):
+    to: list[str] = []
+    cc: list[str] = []
+    bcc: list[str] = []
+    subject: str = ""
+    body: str = ""
+    thread_id: Optional[str] = None
+    message_id: Optional[str] = None
+
+
+class DraftUpdateRequest(BaseModel):
+    to: Optional[list[str]] = None
+    cc: Optional[list[str]] = None
+    bcc: Optional[list[str]] = None
+    subject: Optional[str] = None
+    body: Optional[str] = None
+    thread_id: Optional[str] = None
+    message_id: Optional[str] = None
 
 class ConfigUpdateRequest(BaseModel):
     schedule: Optional[dict] = None
@@ -250,6 +293,39 @@ def _needs_reply(is_unread: bool, category: str, sender: str, subject: str) -> b
     return True
 
 
+# ================= Recipient validation (Phase 2: CC/BCC) =================
+# Loose on purpose: non-empty strings containing "@" with a non-empty
+# local part and domain. Gmail itself rejects truly undeliverable
+# addresses at send time (502), so this only catches typos early.
+MAX_RECIPIENTS_TOTAL = 20
+
+
+def _validate_addresses(values: Any, field: str) -> list[str]:
+    """Clean + loosely validate one address list; 400 on a bad entry."""
+    out: list[str] = []
+    for raw in (values or []):
+        addr = str(raw).strip()
+        if not addr:
+            continue
+        local, sep, domain = addr.partition("@")
+        if not sep or not local or not domain:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid {field} address: {addr!r} (expected name@example.com).",
+            )
+        out.append(addr)
+    return out
+
+
+def _check_recipient_cap(to_count: int, cc: list[str], bcc: list[str]) -> None:
+    """Total recipients across To+Cc+Bcc must stay within the cap."""
+    if to_count + len(cc) + len(bcc) > MAX_RECIPIENTS_TOTAL:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"At most {MAX_RECIPIENTS_TOTAL} recipients total across To, Cc and Bcc.",
+        )
+
+
 # ================= Dashboard & Mails Endpoints =================
 
 @router.get("/dashboard")
@@ -351,6 +427,56 @@ def _mail_obj_from_row(r: dict) -> dict:
     }
 
 
+def _draft_obj_from_row(r: dict) -> dict:
+    """One drafts-folder row (server draft) -> the mail-like object the
+    UI consumes. Draft rows carry ``is_draft`` + ``draft_id`` from the
+    list_threads() union; the UI id is the string ``draft-<id>`` so it
+    can never collide with a mail id (1000 + db id)."""
+    updated_at = r.get("updated_at") or r.get("created_at")
+    body_text = r.get("body_text") or ""
+    received_iso = None
+    if updated_at:
+        try:
+            received_iso = updated_at.isoformat() if hasattr(updated_at, "isoformat") else str(updated_at)
+        except Exception:
+            received_iso = None
+
+    def _split(raw: Any) -> list[str]:
+        return [p.strip() for p in str(raw or "").split(",") if p.strip()]
+
+    return {
+        "id": f"draft-{r['draft_id']}",
+        "draft_id": int(r["draft_id"]),
+        "is_draft": True,
+        "message_id": None,
+        "thread_id": r.get("thread_id") or f"draft-{r['draft_id']}",
+        "sender": "Me",
+        "email": settings.MY_EMAIL or "",
+        "to": _split(r.get("to_addrs")),
+        "cc": _split(r.get("cc_addrs")),
+        "bcc": _split(r.get("bcc_addrs")),
+        "subject": r.get("subject") or "(No subject)",
+        "snippet": r.get("snippet") or "",
+        "body": [body_text] if body_text else [""],
+        "summary": body_text[:140],
+        "time": _display_time(updated_at, r.get("created_at")),
+        "date": received_iso,
+        "received_at": received_iso,
+        "today": _is_today(updated_at),
+        "unread": False,
+        "urgent": False,
+        "starred": False,
+        "archived": False,
+        "trashed": False,
+        "needsReply": False,
+        "tag": "Draft",
+        "cat": "primary",
+        "labels": "DRAFT",
+        "message_count": 1,
+        "unread_count": 0,
+    }
+
+
 @router.get("/mails")
 @router.get("/emails")
 def get_inbox_mails(q: Optional[str] = None, folder: str = "inbox",
@@ -386,6 +512,12 @@ def get_inbox_mails(q: Optional[str] = None, folder: str = "inbox",
 
     mails = []
     for r in rows:
+        if r.get("is_draft"):
+            # Server-draft rows from the drafts-folder union already
+            # carry message_count/unread_count (1/0); mail rows get
+            # theirs from the thread aggregates below.
+            mails.append(_draft_obj_from_row(r))
+            continue
         mail = _mail_obj_from_row(r)
         mail["message_count"] = int(r.get("message_count") or 1)
         mail["unread_count"] = int(r.get("unread_count") or 0)
@@ -399,6 +531,25 @@ def get_inbox_mails(q: Optional[str] = None, folder: str = "inbox",
         "folder": folder,
         "limit": max(1, min(100, int(limit or 30))),
     }
+
+
+@router.get("/folders")
+def list_folders():
+    """Per-folder thread counts (sidebar badges).
+
+    Computed with the exact same label predicates as the folder lists,
+    so a badge always equals the number of rows its folder shows.
+    Not cached — one cheap aggregate query per call.
+    """
+    try:
+        counts = get_folder_counts()
+    except Exception as e:
+        logger.error(f"Error computing folder counts: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Could not compute folder counts: {str(e)}"
+        )
+    return {"status": "success", "folders": counts}
 
 @router.get("/labels")
 def list_labels():
@@ -496,6 +647,7 @@ def get_mail_detail(mail_id: str):
             "body_text": full.get("body_text", ""),
             "body_html": full.get("body_html", ""),
             "label_ids": full.get("label_ids", []),
+            "attachments": full.get("attachments", []),
             "cat": _category_from_labels(full.get("label_ids", [])),
             "unread": bool(email_record.get("is_unread", True)),
             "starred": bool(email_record.get("is_starred", False)),
@@ -503,6 +655,71 @@ def get_mail_detail(mail_id: str):
             "trashed": bool(email_record.get("is_trashed", False)),
         },
     }
+
+
+@router.get("/mails/{mail_id}/attachments/{attachment_id}")
+def download_attachment(mail_id: str, attachment_id: str):
+    """Download one attachment's bytes, proxied from Gmail.
+
+    No local storage: bytes stream straight from Gmail to the client.
+    Refuses with 413 when the attachment exceeds the 10 MB cap, 404
+    when the mail or the attachment id is unknown. Content-Disposition
+    makes the browser save it under the original filename.
+    """
+    email_record = get_email_by_id_or_msg_id(mail_id)
+    if not email_record:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Mail not found.")
+    try:
+        data, filename, mime_type = get_attachment_bytes(
+            email_record["message_id"], attachment_id
+        )
+    except ValueError as e:
+        detail = str(e)
+        if "over the 10 MB" in detail:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail=detail,
+            )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=detail)
+    except Exception as e:
+        logger.error(f"Error downloading attachment {attachment_id} for {mail_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Could not download the attachment from Gmail: {str(e)}"
+        )
+    safe_filename = (filename or "attachment").replace('"', "'").replace("\r", "").replace("\n", "")
+    return Response(
+        content=data,
+        media_type=mime_type or "application/octet-stream",
+        headers={"Content-Disposition": f'attachment; filename="{safe_filename}"'},
+    )
+
+
+@router.get("/mails/{mail_id}/forward")
+def get_forward_draft(mail_id: str):
+    """Server-side forward draft: quoted original + attachments.
+
+    The old forward was purely client-side prefill from the cached
+    plain-text body, so HTML mail and attachments were lost. This
+    returns the prefill (subject/body) plus the original's attachment
+    list, which ones were fetched within the 10 MB total cap
+    (``attached_ids``) and which were skipped and why (``skipped``).
+    The UI sends it via POST /api/send with ``forward_message_id`` +
+    ``forward_attachment_ids`` so the server re-attaches the fetched
+    originals — nothing is dropped silently.
+    """
+    email_record = get_email_by_id_or_msg_id(mail_id)
+    if not email_record:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Mail not found.")
+    try:
+        draft = build_forward_draft(email_record["message_id"])
+    except Exception as e:
+        logger.error(f"Error building forward draft for {mail_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Could not build the forward draft from Gmail: {str(e)}"
+        )
+    return {"status": "success", "draft": draft}
 
 
 # ================= Thread Endpoints (Phase 1) =================
@@ -532,11 +749,13 @@ def get_thread(thread_id: str):
                 full = get_email_full(r["message_id"])
                 m["body_text"] = full.get("body_text", "")
                 m["body_html"] = full.get("body_html", "")
+                m["attachments"] = full.get("attachments", [])
                 m["has_body"] = True
             except Exception as e:
                 logger.error(f"Error fetching full body for latest message in thread {thread_id}: {e}")
                 m["body_text"] = ""
                 m["body_html"] = ""
+                m["attachments"] = []
                 body_error = str(e)
         messages.append(m)
 
@@ -547,6 +766,23 @@ def get_thread(thread_id: str):
     if body_error:
         result["body_error"] = body_error
     return result
+
+
+def _local_archived_flag(req) -> Optional[bool]:
+    """Local is_archived mirror for a state request.
+
+    Spam is stored as archived locally (Gmail removes spam from the
+    inbox); un-spam re-adds INBOX, so it must clear the local flag
+    too — otherwise a restored mail keeps archived=True until the
+    next label sync. An explicit is_archived always wins.
+    """
+    if req.is_archived is not None:
+        return req.is_archived
+    if req.is_spam is True:
+        return True
+    if req.is_spam is False:
+        return False
+    return None
 
 
 @router.post("/threads/{thread_id}/state")
@@ -583,7 +819,7 @@ def update_thread_state(thread_id: str, req: MailStateRequest):
         )
         synced = synced and ok
         if ok:
-            archived = req.is_archived if req.is_archived is not None else (True if req.is_spam else None)
+            archived = _local_archived_flag(req)
             for msg_id in all_ids:
                 update_processed_email_state(
                     message_id_or_pk=msg_id,
@@ -614,14 +850,137 @@ def update_thread_state(thread_id: str, req: MailStateRequest):
     return {"status": "success", "synced_gmail": synced, "updated_count": len(updated_ids)}
 
 
+# ================= JSON-or-FormData parsing for send/reply (Phase 2) ====
+# The UI sends JSON when there are no files and multipart FormData when
+# attachments are present (same field names in both). A Pydantic model
+# parameter only accepts JSON, so a FormData post would 422 — these
+# helpers accept either shape and return one normalized dict. Requires
+# python-multipart (see requirements.txt) for request.form().
+
+async def _read_upload_attachments(form) -> list[tuple[str, str, bytes]]:
+    """Uploaded 'attachments' files from a multipart form, capped.
+
+    Per-file and total caps are both MAX_ATTACHMENT_BYTES (10 MB), the
+    same cap as the download proxy and the forward flow. Over-cap is a
+    413, never a silent truncation.
+
+    NOTE: UploadFile here is starlette's class (imported from
+    starlette.datastructures), NOT fastapi's — Starlette's form parser
+    returns starlette UploadFile instances, and fastapi's class is a
+    subclass of it, so isinstance(x, FastAPIUploadFile) is False for
+    every real upload and the files were silently dropped. Checking
+    against the base class accepts both.
+    """
+    files = form.getlist("attachments")
+    attachments: list[tuple[str, str, bytes]] = []
+    total = 0
+    for f in files:
+        if not isinstance(f, UploadFile):
+            continue
+        data = await f.read()
+        if len(data) > MAX_ATTACHMENT_BYTES:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail=f"Attachment '{f.filename or 'file'}' is over the 10 MB limit.",
+            )
+        total += len(data)
+        if total > MAX_ATTACHMENT_BYTES:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail="Attachments total over the 10 MB limit.",
+            )
+        attachments.append((f.filename or "attachment",
+                            f.content_type or "application/octet-stream", data))
+    return attachments
+
+
+def _form_str(form, name: str) -> str:
+    v = form.get(name)
+    return str(v).strip() if v is not None else ""
+
+
+def _form_list(form, name: str) -> list[str]:
+    return [str(v).strip() for v in form.getlist(name) if str(v).strip()]
+
+
+async def _parse_json_body(request: Request):
+    """request.json() with a 400 (not a 500) on malformed JSON."""
+    try:
+        return await request.json()
+    except Exception:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                            detail="Request body is not valid JSON.")
+
+
+async def _parse_send_request(request: Request) -> dict:
+    """POST /mails/send body as JSON or multipart FormData, normalized."""
+    content_type = (request.headers.get("content-type") or "").lower()
+    if "multipart/form-data" in content_type:
+        form = await request.form()
+        return {
+            "to": _form_str(form, "to"),
+            "subject": _form_str(form, "subject"),
+            "body": _form_str(form, "body"),
+            "cc": _form_list(form, "cc"),
+            "bcc": _form_list(form, "bcc"),
+            "forward_message_id": _form_str(form, "forward_message_id") or None,
+            "forward_attachment_ids": _form_list(form, "forward_attachment_ids"),
+            "attachments": await _read_upload_attachments(form),
+        }
+    req = SendRequest.model_validate(await _parse_json_body(request))
+    return {
+        "to": req.to, "subject": req.subject, "body": req.body,
+        "cc": req.cc or [], "bcc": req.bcc or [],
+        "forward_message_id": req.forward_message_id,
+        "forward_attachment_ids": req.forward_attachment_ids or [],
+        "attachments": [],
+    }
+
+
+async def _parse_reply_request(request: Request, allow_reply_all: bool) -> dict:
+    """Reply body as JSON or multipart FormData, normalized."""
+    content_type = (request.headers.get("content-type") or "").lower()
+    if "multipart/form-data" in content_type:
+        form = await request.form()
+        return {
+            "body": _form_str(form, "body"),
+            "reply_all": _form_str(form, "reply_all").lower() in ("true", "1", "yes") if allow_reply_all else False,
+            "cc": _form_list(form, "cc"),
+            "bcc": _form_list(form, "bcc"),
+            "attachments": await _read_upload_attachments(form),
+        }
+    payload = await _parse_json_body(request)
+    if allow_reply_all:
+        req = ThreadReplyRequest.model_validate(payload)
+        reply_all = bool(req.reply_all)
+    else:
+        req = ReplyRequest.model_validate(payload)
+        reply_all = False
+    return {
+        "body": req.body, "reply_all": reply_all,
+        "cc": req.cc or [], "bcc": req.bcc or [], "attachments": [],
+    }
+
+
 @router.post("/threads/{thread_id}/reply")
-def reply_to_thread(thread_id: str, req: ThreadReplyRequest):
-    """Reply in-thread on the thread's LATEST message."""
-    body = (req.body or "").strip()
+async def reply_to_thread(thread_id: str, request: Request):
+    """Reply in-thread on the thread's LATEST message.
+
+    reply_all keeps the original Cc and adds any new Cc supplied;
+    Bcc is accepted too (Gmail strips it from the sent message's
+    visible headers — see gmail_service._build_outgoing_message).
+    Accepts JSON or multipart FormData (attachments as 'attachments'
+    files, same 10 MB caps as compose).
+    """
+    data = await _parse_reply_request(request, allow_reply_all=True)
+    body = (data["body"] or "").strip()
     if not body:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Reply body cannot be empty.")
     if len(body) > 100000:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Reply body is too long (max 100,000 characters).")
+    cc_addrs = _validate_addresses(data["cc"], "Cc")
+    bcc_addrs = _validate_addresses(data["bcc"], "Bcc")
+    _check_recipient_cap(1, cc_addrs, bcc_addrs)
 
     rows = get_thread_messages(thread_id)
     if not rows:
@@ -629,7 +988,9 @@ def reply_to_thread(thread_id: str, req: ThreadReplyRequest):
     latest = rows[-1]
 
     try:
-        sent_id = reply_to_email(latest["message_id"], body, reply_all=req.reply_all)
+        sent_id = reply_to_email(latest["message_id"], body, reply_all=data["reply_all"],
+                                 cc_addrs=cc_addrs, bcc_addrs=bcc_addrs,
+                                 attachments=data["attachments"] or None)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except Exception as e:
@@ -648,20 +1009,30 @@ def reply_to_thread(thread_id: str, req: ThreadReplyRequest):
 
 
 @router.post("/mails/{mail_id}/reply")
-def reply_to_mail(mail_id: str, req: ReplyRequest):
-    """Reply in-thread via the Gmail API (not a mailto: draft)."""
-    body = (req.body or "").strip()
+async def reply_to_mail(mail_id: str, request: Request):
+    """Reply in-thread via the Gmail API (not a mailto: draft).
+
+    Accepts JSON or multipart FormData (attachments as 'attachments'
+    files, same 10 MB caps as compose).
+    """
+    data = await _parse_reply_request(request, allow_reply_all=False)
+    body = (data["body"] or "").strip()
     if not body:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Reply body cannot be empty.")
     if len(body) > 100000:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Reply body is too long (max 100,000 characters).")
+    cc_addrs = _validate_addresses(data["cc"], "Cc")
+    bcc_addrs = _validate_addresses(data["bcc"], "Bcc")
+    _check_recipient_cap(1, cc_addrs, bcc_addrs)
 
     email_record = get_email_by_id_or_msg_id(mail_id)
     if not email_record:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Mail not found.")
 
     try:
-        sent_id = reply_to_email(email_record["message_id"], body)
+        sent_id = reply_to_email(email_record["message_id"], body,
+                                 cc_addrs=cc_addrs, bcc_addrs=bcc_addrs,
+                                 attachments=data["attachments"] or None)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except Exception as e:
@@ -676,11 +1047,22 @@ def reply_to_mail(mail_id: str, req: ReplyRequest):
 
 
 @router.post("/mails/send")
-def compose_and_send(req: SendRequest):
-    """Compose + send a new email via the Gmail API."""
-    to_address = (req.to or "").strip()
-    subject = (req.subject or "").strip()
-    body = (req.body or "").strip()
+async def compose_and_send(request: Request):
+    """Compose + send a new email via the Gmail API (Cc/Bcc supported).
+
+    Accepts JSON or multipart FormData (uploaded files as 'attachments'
+    fields, per-file and total caps 10 MB — a 413, never silent).
+    Bcc recipients receive the mail but Gmail strips the Bcc header
+    from the stored/sent copy, so their addresses never appear in any
+    visible header. When ``forward_message_id`` is given, the
+    original's attachments are re-attached within the 10 MB total cap;
+    the response reports which were attached and which were skipped
+    (with reasons) — nothing is dropped silently.
+    """
+    data = await _parse_send_request(request)
+    to_address = (data["to"] or "").strip()
+    subject = (data["subject"] or "").strip()
+    body = (data["body"] or "").strip()
     if "@" not in to_address or "." not in to_address.split("@")[-1]:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="A valid recipient email address is required.")
     if not subject:
@@ -689,9 +1071,36 @@ def compose_and_send(req: SendRequest):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Body cannot be empty.")
     if len(body) > 100000:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Body is too long (max 100,000 characters).")
+    cc_addrs = _validate_addresses(data["cc"], "Cc")
+    bcc_addrs = _validate_addresses(data["bcc"], "Bcc")
+    _check_recipient_cap(1, cc_addrs, bcc_addrs)
+    forward_id = (data["forward_message_id"] or "").strip() or None
+    forward_aids = [str(a).strip() for a in (data["forward_attachment_ids"] or []) if str(a).strip()]
+    if forward_aids and not forward_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="forward_attachment_ids requires forward_message_id.",
+        )
+
+    attachments: list[tuple[str, str, bytes]] = list(data["attachments"] or [])
+    skipped_forward: list[dict] = []
+    if forward_id:
+        try:
+            if not forward_aids:
+                forward_aids = [a["attachmentId"] for a in get_message_attachments(forward_id)]
+            fwd_attachments, skipped_forward = fetch_forward_attachments(forward_id, forward_aids)
+            attachments.extend(fwd_attachments)
+        except Exception as e:
+            logger.error(f"Error fetching forward attachments for {forward_id}: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=f"Could not fetch the original's attachments from Gmail: {str(e)}"
+            )
 
     try:
-        sent_id = send_email(to_address, subject, body)
+        sent_id = send_email(to_address, subject, body,
+                             cc_addrs=cc_addrs, bcc_addrs=bcc_addrs,
+                             attachments=attachments or None)
     except Exception as e:
         logger.error(f"Error sending email to {to_address}: {e}")
         raise HTTPException(
@@ -700,7 +1109,200 @@ def compose_and_send(req: SendRequest):
         )
     if not sent_id:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Gmail did not return a sent message id.")
-    return {"status": "success", "sent_message_id": sent_id}
+    result: dict = {"status": "success", "sent_message_id": sent_id}
+    if forward_id:
+        result["forwarded_attachments"] = [f for f, _, _ in fwd_attachments]
+        result["skipped_forward_attachments"] = skipped_forward
+        # Alias the UI reads (d.skipped_attachments || d.skipped).
+        result["skipped_attachments"] = skipped_forward
+    return result
+
+
+# ================= Drafts (server-side autosave, Phase 2) =================
+# Drafts live in TiDB (see app/database.py), so they survive refresh
+# and appear in folder=drafts. A reply draft (message_id set) is sent
+# in-thread via reply_to_email; a fresh draft is sent via send_email.
+# The draft is deleted ONLY after Gmail confirms the send.
+
+@router.post("/drafts")
+def create_draft_endpoint(req: DraftCreateRequest):
+    """Autosave a new draft (compose or reply)."""
+    to_addrs = _validate_addresses(req.to, "To")
+    cc_addrs = _validate_addresses(req.cc, "Cc")
+    bcc_addrs = _validate_addresses(req.bcc, "Bcc")
+    _check_recipient_cap(0, to_addrs + cc_addrs, bcc_addrs)
+    subject = (req.subject or "").strip()
+    body = req.body or ""
+    if not to_addrs and not subject and not body.strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Draft is empty: provide a recipient, a subject, or a body.",
+        )
+    if len(body) > 100000:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Draft body is too long (max 100,000 characters).")
+    try:
+        draft = create_draft(to_addrs, cc_addrs, bcc_addrs, subject, body,
+                             thread_id=(req.thread_id or "").strip() or None,
+                             message_id=(req.message_id or "").strip() or None)
+    except Exception as e:
+        logger.error(f"Error creating draft: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Could not save the draft: {str(e)}"
+        )
+    return {"status": "success", "draft": draft}
+
+
+@router.get("/drafts")
+def list_drafts_endpoint(limit: int = 30, cursor: Optional[str] = None):
+    """Server drafts, newest first (keyset-paginated)."""
+    try:
+        drafts, next_cursor, has_more = list_drafts(limit=limit, cursor=cursor)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except Exception as e:
+        logger.error(f"Error listing drafts: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Could not list drafts: {str(e)}"
+        )
+    return {"status": "success", "drafts": drafts,
+            "next_cursor": next_cursor, "has_more": has_more}
+
+
+@router.get("/drafts/{draft_id}")
+def get_draft_endpoint(draft_id: int):
+    """One draft by id."""
+    try:
+        draft = get_draft(draft_id)
+    except Exception as e:
+        logger.error(f"Error fetching draft {draft_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Could not fetch the draft: {str(e)}"
+        )
+    if not draft:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Draft not found.")
+    return {"status": "success", "draft": draft}
+
+
+@router.put("/drafts/{draft_id}")
+def update_draft_endpoint(draft_id: int, req: DraftUpdateRequest):
+    """Autosave update of a draft (partial: only given fields change)."""
+    updates: dict = {}
+    if req.to is not None:
+        updates["to"] = _validate_addresses(req.to, "To")
+    if req.cc is not None:
+        updates["cc"] = _validate_addresses(req.cc, "Cc")
+    if req.bcc is not None:
+        updates["bcc"] = _validate_addresses(req.bcc, "Bcc")
+    if req.subject is not None:
+        updates["subject"] = req.subject.strip()
+    if req.body is not None:
+        if len(req.body) > 100000:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Draft body is too long (max 100,000 characters).")
+        updates["body"] = req.body
+    if req.thread_id is not None:
+        updates["thread_id"] = (req.thread_id or "").strip() or None
+    if req.message_id is not None:
+        updates["message_id"] = (req.message_id or "").strip() or None
+    if "to" in updates or "cc" in updates or "bcc" in updates:
+        # Cap the merged recipient set, not just the changed field.
+        current = get_draft(draft_id) or {}
+        merged_to = updates.get("to", current.get("to", []))
+        merged_cc = updates.get("cc", current.get("cc", []))
+        merged_bcc = updates.get("bcc", current.get("bcc", []))
+        _check_recipient_cap(0, list(merged_to) + list(merged_cc), list(merged_bcc))
+    try:
+        draft = update_draft(draft_id, updates)
+    except Exception as e:
+        logger.error(f"Error updating draft {draft_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Could not update the draft: {str(e)}"
+        )
+    if not draft:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Draft not found.")
+    return {"status": "success", "draft": draft}
+
+
+@router.delete("/drafts/{draft_id}")
+def delete_draft_endpoint(draft_id: int):
+    """Discard a draft."""
+    try:
+        ok = delete_draft(draft_id)
+    except Exception as e:
+        logger.error(f"Error deleting draft {draft_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Could not delete the draft: {str(e)}"
+        )
+    if not ok:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Draft not found.")
+    return {"status": "success", "message": "Draft deleted."}
+
+
+@router.post("/drafts/{draft_id}/send")
+def send_draft_endpoint(draft_id: int):
+    """Send a draft via Gmail, then delete it (only on success).
+
+    Reply drafts (message_id set) go in-thread via reply_to_email —
+    the draft's To list is NOT used there, because a reply's
+    recipients come from the original message (reply_to_email derives
+    them); the draft's Cc/Bcc are still applied on top. Fresh drafts
+    need at least one To address and a subject.
+    """
+    try:
+        draft = get_draft(draft_id)
+    except Exception as e:
+        logger.error(f"Error fetching draft {draft_id} for send: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Could not fetch the draft: {str(e)}"
+        )
+    if not draft:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Draft not found.")
+    body = (draft.get("body") or "").strip()
+    if not body:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Draft body is empty; nothing to send.")
+    cc_addrs = draft.get("cc") or []
+    bcc_addrs = draft.get("bcc") or []
+    try:
+        if draft.get("message_id"):
+            sent_id = reply_to_email(draft["message_id"], body,
+                                     cc_addrs=cc_addrs, bcc_addrs=bcc_addrs)
+            thread_id = draft.get("thread_id")
+        else:
+            to_addrs = draft.get("to") or []
+            if not to_addrs:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Draft has no recipient; add a To address before sending.")
+            subject = (draft.get("subject") or "").strip()
+            if not subject:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Draft has no subject.")
+            sent_id = send_email(to_addrs, subject, body,
+                                 cc_addrs=cc_addrs, bcc_addrs=bcc_addrs)
+            thread_id = None
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except Exception as e:
+        logger.error(f"Error sending draft {draft_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Could not send the draft via Gmail: {str(e)}"
+        )
+    if not sent_id:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Gmail did not return a sent message id.")
+    # Delete only after Gmail confirmed the send.
+    try:
+        delete_draft(draft_id)
+    except Exception as e:
+        logger.error(f"Draft {draft_id} sent ({sent_id}) but could not be deleted: {e}")
+    result: dict = {"status": "success", "sent_message_id": sent_id}
+    if thread_id:
+        result["thread_id"] = thread_id
+    return result
 
 
 # ================= Bidirectional Gmail Sync Endpoints =================
@@ -733,7 +1335,7 @@ def update_mail_state(mail_id: str, req: MailStateRequest):
             message_id_or_pk=msg_id,
             is_unread=req.is_unread,
             is_starred=req.is_starred,
-            is_archived=req.is_archived if req.is_archived is not None else (True if req.is_spam else None),
+            is_archived=_local_archived_flag(req),
             is_trashed=req.is_trash
         )
 
@@ -807,7 +1409,7 @@ def bulk_update_mail_state(req: BulkStateRequest):
                 message_id_or_pk=msg_id,
                 is_unread=req.is_unread,
                 is_starred=req.is_starred,
-                is_archived=req.is_archived if req.is_archived is not None else (True if req.is_spam else None),
+                is_archived=_local_archived_flag(req),
                 is_trashed=req.is_trash,
             )
         dashboard_cache.delete("mails")

@@ -18,6 +18,14 @@ logger = logging.getLogger(__name__)
 # so a stalled Gmail call could hang a Render worker thread forever.
 GMAIL_HTTP_TIMEOUT = 30
 
+# Attachment size caps (Phase 2). Gmail allows 25 MB per message, but
+# this app runs on the Render free tier (512 MB) and proxies attachment
+# bytes through memory, so one attachment — and one forward's total —
+# is capped at 10 MB. Anything bigger is refused with a clear error,
+# never silently dropped or half-sent.
+MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024
+MAX_FORWARD_ATTACHMENTS_BYTES = 10 * 1024 * 1024
+
 
 def _utcnow_naive() -> datetime:
     """Timezone-naive UTC now (matches TiDB DATETIME columns)."""
@@ -112,6 +120,90 @@ def _extract_body(payload: dict) -> tuple[str, str]:
     return text_plain, text_html
 
 
+def extract_attachments(payload: dict) -> list[dict]:
+    """Attachment METADATA from a message payload — no bodies downloaded.
+
+    A part is an attachment when its body carries an ``attachmentId``
+    (Gmail only sets that on real attachment parts, including inline
+    images). Returns [{filename, mimeType, size, attachmentId, partId}]
+    in payload order; ``size`` is the decoded byte size when Gmail
+    reports it, else None. Bodies are never stored in the DB — the UI
+    downloads bytes on demand via GET /api/mails/{id}/attachments/{aid}.
+    """
+    found: list[dict] = []
+
+    def walk(part: dict):
+        body = part.get("body", {}) or {}
+        attachment_id = body.get("attachmentId")
+        if attachment_id:
+            try:
+                size = int(body["size"]) if body.get("size") is not None else None
+            except (TypeError, ValueError):
+                size = None
+            found.append({
+                "filename": part.get("filename", "") or "",
+                "mimeType": part.get("mimeType", "application/octet-stream"),
+                "size": size,
+                "attachmentId": attachment_id,
+                "partId": part.get("partId", ""),
+            })
+        for sub in part.get("parts", []) or []:
+            walk(sub)
+
+    walk(payload or {})
+    return found
+
+
+def get_message_attachments(message_id: str) -> list[dict]:
+    """Attachment metadata for one message (one format='full' fetch)."""
+    service = get_gmail_client()
+    detail = service.users().messages().get(
+        userId="me", id=message_id, format="full",
+    ).execute()
+    return extract_attachments(detail.get("payload", {}))
+
+
+def get_attachment_bytes(message_id: str, attachment_id: str) -> tuple[bytes, str, str]:
+    """Download one attachment's bytes from Gmail (streamed, no local storage).
+
+    Returns (data, filename, mimeType). The filename/mime come from the
+    message's parts (one format='full' fetch); the bytes come from
+    ``messages.attachments.get``. Refuses with ValueError when the
+    attachment is missing or its decoded size exceeds
+    MAX_ATTACHMENT_BYTES (the API layer turns that into HTTP 413).
+    """
+    service = get_gmail_client()
+    detail = service.users().messages().get(
+        userId="me", id=message_id, format="full",
+    ).execute()
+    meta = next(
+        (a for a in extract_attachments(detail.get("payload", {}))
+         if a["attachmentId"] == attachment_id),
+        None,
+    )
+    if meta is None:
+        raise ValueError(f"Attachment {attachment_id!r} not found on message {message_id}.")
+    if meta.get("size") is not None and meta["size"] > MAX_ATTACHMENT_BYTES:
+        raise ValueError(
+            f"Attachment {meta.get('filename') or attachment_id!r} is "
+            f"{meta['size']} bytes, over the 10 MB download cap."
+        )
+    resp = service.users().messages().attachments().get(
+        userId="me", messageId=message_id, id=attachment_id,
+    ).execute()
+    raw = resp.get("data", "")
+    try:
+        data = base64.urlsafe_b64decode(raw.encode("utf-8"))
+    except Exception:
+        raise ValueError(f"Attachment {attachment_id!r} could not be decoded from Gmail.")
+    if len(data) > MAX_ATTACHMENT_BYTES:
+        raise ValueError(
+            f"Attachment {meta.get('filename') or attachment_id!r} is "
+            f"{len(data)} bytes, over the 10 MB download cap."
+        )
+    return data, meta.get("filename") or "attachment", meta.get("mimeType") or "application/octet-stream"
+
+
 def get_email_full(message_id: str) -> dict:
     """Fetch one message with its FULL body for the reading view.
 
@@ -130,6 +222,9 @@ def get_email_full(message_id: str) -> dict:
     meta["body_text"] = text_plain
     meta["body_html"] = text_html
     meta["thread_id"] = detail.get("threadId")
+    # Attachment metadata only (no bodies) — the reader shows the list
+    # and downloads bytes on demand via /api/mails/{id}/attachments/{aid}.
+    meta["attachments"] = extract_attachments(detail.get("payload", {}))
     return meta
 
 
@@ -522,26 +617,77 @@ def send_daily_digest_email(subject_title: str, markdown_content: str) -> bool:
     return True
 
 
-def send_email(to_address: str, subject: str, body_text: str) -> Optional[str]:
+def _build_outgoing_message(subject: str, body_text: str, to_addrs: list[str],
+                            cc_addrs: Optional[list[str]] = None,
+                            bcc_addrs: Optional[list[str]] = None,
+                            attachments: Optional[list[tuple[str, str, bytes]]] = None,
+                            in_reply_to: Optional[str] = None,
+                            references: Optional[str] = None) -> EmailMessage:
+    """One shared RFC822 builder for send/reply/forward (reuse rule).
+
+    ``attachments`` is a list of (filename, mime_type, bytes). The Bcc
+    header is set on the raw message exactly as Gmail expects: Gmail
+    STRIPS the Bcc header from the copy it stores/sends, so Bcc
+    recipients still receive the mail but their addresses never appear
+    in any visible header of the sent message. That is Gmail's own
+    behaviour, not something this code can or should work around —
+    the API response says which Bcc recipients were included.
+    """
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = "me"
+    msg["To"] = ", ".join(to_addrs)
+    if cc_addrs:
+        msg["Cc"] = ", ".join(cc_addrs)
+    if bcc_addrs:
+        msg["Bcc"] = ", ".join(bcc_addrs)
+    if in_reply_to:
+        msg["In-Reply-To"] = in_reply_to
+    if references:
+        msg["References"] = references
+    msg.set_content(body_text)
+    for filename, mime_type, data in (attachments or []):
+        maintype, _, subtype = (mime_type or "application/octet-stream").partition("/")
+        msg.add_attachment(
+            data,
+            maintype=maintype or "application",
+            subtype=subtype or "octet-stream",
+            filename=filename or "attachment",
+        )
+    return msg
+
+
+def send_email(to_address: Union[str, list[str]], subject: str, body_text: str,
+               cc_addrs: Optional[list[str]] = None,
+               bcc_addrs: Optional[list[str]] = None,
+               attachments: Optional[list[tuple[str, str, bytes]]] = None) -> Optional[str]:
     """Compose + send a new email via the Gmail API (gmail.send scope).
 
     Previously the UI could only open a ``mailto:`` draft — no real send
     from InboxCura at all, even though the granted OAuth scopes already
     include gmail.send. Returns the sent Gmail message id, or None.
+    ``to_address`` is one address or a list (draft send may hold
+    several). ``cc_addrs``/``bcc_addrs`` are optional extra recipients
+    (validated by the API layer: loose @-check, 20 recipients total
+    across To+Cc+Bcc). ``attachments`` are (filename, mime, bytes)
+    tuples, used by the forward flow to re-attach originals.
     """
     service = get_gmail_client()
-    msg = EmailMessage()
-    msg["Subject"] = subject
-    msg["From"] = "me"
-    msg["To"] = to_address
-    msg.set_content(body_text)
+    to_list = [to_address] if isinstance(to_address, str) else list(to_address)
+    msg = _build_outgoing_message(
+        subject, body_text, to_list,
+        cc_addrs=cc_addrs, bcc_addrs=bcc_addrs, attachments=attachments,
+    )
     raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
     sent = service.users().messages().send(userId="me", body={"raw": raw}).execute()
     logger.info(f"Sent email to {to_address} (id={sent.get('id')})")
     return sent.get("id")
 
 
-def reply_to_email(message_id: str, body_text: str, reply_all: bool = False) -> Optional[str]:
+def reply_to_email(message_id: str, body_text: str, reply_all: bool = False,
+                   cc_addrs: Optional[list[str]] = None,
+                   bcc_addrs: Optional[list[str]] = None,
+                   attachments: Optional[list[tuple[str, str, bytes]]] = None) -> Optional[str]:
     """Reply in-thread to a Gmail message via the Gmail API.
 
     Fetches the original (thread id, sender, subject), then sends with
@@ -553,6 +699,10 @@ def reply_to_email(message_id: str, body_text: str, reply_all: bool = False) -> 
     the original sender plus the original To recipients, Cc is the
     original Cc recipients (each minus the user's own address and
     duplicates). With reply_all=False the reply goes only to the sender.
+    ``cc_addrs``/``bcc_addrs`` are NEW recipients the user adds on top:
+    reply-all keeps the original Cc and appends the new Cc; Bcc is
+    never visible in the sent message's headers (Gmail strips it —
+    see _build_outgoing_message).
     Returns the sent id.
     """
     service = get_gmail_client()
@@ -592,20 +742,28 @@ def reply_to_email(message_id: str, body_text: str, reply_all: bool = False) -> 
             if addr.lower() not in seen:
                 seen.add(addr.lower())
                 cc_list.append(addr)
+    # New Cc the user adds on top (deduped against what is already there).
+    seen_cc = {a.lower() for a in cc_list}
+    if my_email:
+        seen_cc.add(my_email)
+    for addr in (cc_addrs or []):
+        if addr.lower() not in seen_cc:
+            seen_cc.add(addr.lower())
+            cc_list.append(addr)
 
-    msg = EmailMessage()
-    msg["Subject"] = subject
-    msg["From"] = "me"
-    msg["To"] = ", ".join(recipients)
-    if cc_list:
-        msg["Cc"] = ", ".join(cc_list)
+    references = None
     if headers.get("Message-ID"):
-        msg["In-Reply-To"] = headers["Message-ID"]
         # Preserve the original References chain, appending this
         # message's id so the thread stays linked downstream.
         orig_refs = (headers.get("References") or "").strip()
-        msg["References"] = f"{orig_refs} {headers['Message-ID']}".strip()
-    msg.set_content(body_text)
+        references = f"{orig_refs} {headers['Message-ID']}".strip()
+    msg = _build_outgoing_message(
+        subject, body_text, recipients,
+        cc_addrs=cc_list or None, bcc_addrs=bcc_addrs or None,
+        in_reply_to=headers.get("Message-ID") or None,
+        references=references,
+        attachments=attachments,
+    )
     raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
     sent = service.users().messages().send(
         userId="me",
@@ -613,3 +771,104 @@ def reply_to_email(message_id: str, body_text: str, reply_all: bool = False) -> 
     ).execute()
     logger.info(f"Sent reply to {sender_email} in thread {original.get('threadId')} (id={sent.get('id')}, reply_all={reply_all})")
     return sent.get("id")
+
+
+def fetch_forward_attachments(message_id: str, attachment_ids: list[str],
+                              total_cap: int = MAX_FORWARD_ATTACHMENTS_BYTES
+                              ) -> tuple[list[tuple[str, str, bytes]], list[dict]]:
+    """Fetch original attachments for a forward, within the total cap.
+
+    Returns (attached, skipped): attached is a list of
+    (filename, mimeType, bytes) ready for send_email(); skipped is a
+    list of {attachment_id, filename, reason} — NOTHING is dropped
+    silently. Reasons: "not found on the original message" (stale id),
+    "would exceed the 10 MB total forward cap", or the Gmail fetch
+    error. Attachments with an unknown size are fetched and counted
+    against the cap by their real decoded size.
+    """
+    attached: list[tuple[str, str, bytes]] = []
+    skipped: list[dict] = []
+    if not attachment_ids:
+        return attached, skipped
+    try:
+        metas = {a["attachmentId"]: a for a in get_message_attachments(message_id)}
+    except Exception as e:
+        logger.error(f"Forward: could not list attachments for {message_id}: {e}")
+        return attached, [
+            {"attachment_id": aid, "filename": "", "reason": f"Could not list original attachments: {e}"}
+            for aid in attachment_ids
+        ]
+    running_total = 0
+    for aid in attachment_ids:
+        meta = metas.get(aid)
+        if meta is None:
+            skipped.append({"attachment_id": aid, "filename": "",
+                            "reason": "Not found on the original message."})
+            continue
+        filename = meta.get("filename") or aid
+        known_size = meta.get("size")
+        if known_size is not None and running_total + known_size > total_cap:
+            skipped.append({"attachment_id": aid, "filename": filename,
+                            "reason": "Would exceed the 10 MB total forward cap."})
+            continue
+        try:
+            data, fname, mime = get_attachment_bytes(message_id, aid)
+        except ValueError as e:
+            skipped.append({"attachment_id": aid, "filename": filename, "reason": str(e)})
+            continue
+        except Exception as e:
+            logger.error(f"Forward: could not fetch attachment {aid} for {message_id}: {e}")
+            skipped.append({"attachment_id": aid, "filename": filename,
+                            "reason": f"Could not fetch from Gmail: {e}"})
+            continue
+        if running_total + len(data) > total_cap:
+            skipped.append({"attachment_id": aid, "filename": filename,
+                            "reason": "Would exceed the 10 MB total forward cap."})
+            continue
+        running_total += len(data)
+        attached.append((fname, mime, data))
+    return attached, skipped
+
+
+def build_forward_draft(message_id: str) -> dict:
+    """Server-side forward draft for one message.
+
+    The old forward flow was purely client-side prefill from the cached
+    plain-text body: HTML mail and attachments did not survive. This
+    returns the full prefill the UI needs — quoted original (plain
+    text), a ``Fwd:`` subject, the original's attachment metadata, and
+    which attachments were fetched within the 10 MB total cap vs
+    skipped (with reasons). The UI then sends it via POST /api/send
+    with ``forward_message_id`` + ``forward_attachment_ids`` so the
+    server re-attaches the fetched originals.
+    """
+    full = get_email_full(message_id)
+    subject = full.get("subject", "") or "(no subject)"
+    if not subject.lower().startswith("fwd:"):
+        subject = f"Fwd: {subject}"
+    quoted = (
+        "\n\n---------- Forwarded message ----------\n"
+        f"From: {full.get('sender', '')}\n"
+        f"Date: {full.get('date', '')}\n"
+        f"Subject: {full.get('subject', '')}\n\n"
+        f"{full.get('body_text', '')}"
+    )
+    metas = full.get("attachments", []) or []
+    attachment_ids = [a["attachmentId"] for a in metas]
+    attached, skipped = fetch_forward_attachments(message_id, attachment_ids)
+    return {
+        "message_id": message_id,
+        "thread_id": full.get("thread_id"),
+        "to": "",
+        "subject": subject,
+        "body": quoted,
+        "attachments": [
+            {"attachment_id": a["attachmentId"], "filename": a.get("filename", ""),
+             "mimeType": a.get("mimeType", ""), "size": a.get("size")}
+            for a in metas
+        ],
+        "attached_ids": [a["attachmentId"] for a in metas
+                         if a["attachmentId"] not in {s["attachment_id"] for s in skipped}],
+        "skipped": skipped,
+        "total_attachment_bytes": sum(len(data) for _, _, data in attached),
+    }
