@@ -1,12 +1,14 @@
 import asyncio
 import logging
+import os
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime
+from pathlib import Path
 from zoneinfo import ZoneInfo
 from fastapi import FastAPI, Request
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import HTMLResponse
 
 from app.database import init_db, get_system_config
 from app.routes.api import router as api_router, cron_router as api_cron_router
@@ -123,9 +125,15 @@ app = FastAPI(
 async def add_cache_headers(request: Request, call_next):
     response = await call_next(request)
     path = request.url.path
-    # Static assets: Tell browser to cache for 1 hour (instant disk-cache reloads)
+    # Static assets: revalidate on every load (no-cache), never a blind
+    # max-age window. HOTFIX 2026-11-16 (round 3): max-age=3600 let the
+    # browser serve a stale app.js for an hour after a deploy, so the
+    # Urgent-card text fix shipped in round 2 never reached the live
+    # browser even though the deploy itself was correct. Starlette
+    # answers conditional requests with 304, so unchanged files still
+    # cost almost nothing.
     if path.startswith(("/css", "/js", "/assets", "/static")):
-        response.headers["Cache-Control"] = "public, max-age=3600"
+        response.headers["Cache-Control"] = "no-cache, must-revalidate"
     # API endpoints: Never browser-cache dynamic data
     elif path.startswith("/api/"):
         response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
@@ -142,7 +150,31 @@ app.mount("/js", StaticFiles(directory="static/js"), name="js")
 app.mount("/assets", StaticFiles(directory="static/assets"), name="assets")
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
+def _asset_version():
+    """Cache-busting version for the dashboard's static assets.
+
+    Render sets RENDER_GIT_COMMIT at deploy time, so every deploy is a
+    new asset URL and even a warm browser cache — e.g. one cached under
+    the old max-age=3600 headers — is bypassed (HOTFIX 2026-11-16,
+    round 3). Locally, fall back to the app.js mtime so edits are
+    picked up without a restart.
+    """
+    commit = os.environ.get("RENDER_GIT_COMMIT", "")
+    if commit:
+        return commit[:7]
+    try:
+        return str(int(Path("static/js/app.js").stat().st_mtime))
+    except OSError:
+        return "dev"
+
+
 @app.get("/")
 def serve_dashboard():
-    """Serves the InboxCura web UI."""
-    return FileResponse("static/index.html")
+    """Serves the InboxCura web UI, with versioned asset URLs."""
+    html = Path("static/index.html").read_text(encoding="utf-8")
+    v = _asset_version()
+    html = (html.replace('href="css/style.css"', 'href="css/style.css?v=' + v + '"')
+                .replace('src="js/app.js"', 'src="js/app.js?v=' + v + '"')
+                .replace('src="assets/logo-lockup.png"', 'src="assets/logo-lockup.png?v=' + v + '"')
+                .replace("src='assets/logo-lockup.svg'", "src='assets/logo-lockup.svg?v=" + v + "'"))
+    return HTMLResponse(html)

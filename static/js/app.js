@@ -250,6 +250,23 @@ function miniRowHtml(m){
 }
 
 /* ================= Rendering ================= */
+/* HOTFIX 2026-11-16 (round 3): the two urgent texts are pure
+   functions of the SERVER urgent count (plus the first urgent
+   subject when the pool holds one). They used to be inline ternaries
+   in renderStats/renderLists; extracting them makes the rule testable
+   in Node (tests/test_hotfix3.js) and stops the two sites drifting
+   apart again. count is the inbox-wide server count — never the
+   Primary-page-1 pool, which is silent for urgent mail in other tabs
+   or on later pages. */
+function urgentSubtext(count, firstSubject){
+  if(firstSubject) return "Priority: <b>"+escapeHtml(firstSubject)+"</b>";
+  if(count > 0) return count + " urgent mail" + (count > 1 ? "s" : "") + " in your inbox — open Urgent to see them";
+  return "Nothing marked urgent";
+}
+function urgentSectionHtml(count){
+  if(count > 0) return '<div class="empty">' + count + ' urgent mail' + (count > 1 ? 's' : '') + ' in your inbox — use View all above to open the Urgent filter.</div>';
+  return '<div class="empty">Nothing urgent right now.</div>';
+}
 function renderStats(){
   /* Prefer the global inbox_counts from /api/dashboard when the backend
      provides them; otherwise count the loaded mail locally. */
@@ -289,8 +306,7 @@ function renderStats(){
      user's own mail (sender email == MY_EMAIL, see USER_EMAIL). */
   var firstUrgent = pool.filter(function(m){return m.urgent;})[0];
   var firstReply = pool.filter(function(m){return m.needsReply && (!USER_EMAIL || String(m.email || "").toLowerCase() !== USER_EMAIL);})[0];
-  $("#statUrgentSub").innerHTML = firstUrgent ? "Priority: <b>"+escapeHtml(firstUrgent.subject)+"</b>"
-    : (c.urgent > 0 ? c.urgent + " urgent mail" + (c.urgent > 1 ? "s" : "") + " in your inbox — open Urgent to see them" : "Nothing marked urgent");
+  $("#statUrgentSub").innerHTML = urgentSubtext(c.urgent, firstUrgent ? firstUrgent.subject : null);
   $("#statReplySub").innerHTML = firstReply ? "Waiting from: <b>"+escapeHtml(firstReply.sender)+"</b>"
     : (c.reply > 0 ? c.reply + " thread" + (c.reply > 1 ? "s" : "") + " waiting — open Awaiting reply to see them" : "No one is waiting on you");
   /* AI brief: when initBackend painted the latest briefing report
@@ -473,10 +489,7 @@ function renderLists(){
      count says there are some, say so instead of "Nothing urgent
      right now"; the panel's View all button opens the Urgent filter. */
   var urgentCount = INBOX_COUNTS ? (INBOX_COUNTS.urgent || 0) : 0;
-  $("#urgentList").innerHTML = urgent.length ? urgent.map(miniRowHtml).join("")
-    : (urgentCount > 0
-      ? '<div class="empty">' + urgentCount + ' urgent mail' + (urgentCount > 1 ? 's' : '') + ' in your inbox — use View all above to open the Urgent filter.</div>'
-      : '<div class="empty">Nothing urgent right now.</div>');
+  $("#urgentList").innerHTML = urgent.length ? urgent.map(miniRowHtml).join("") : urgentSectionHtml(urgentCount);
   $("#recentList").innerHTML = pool.slice(0,5).map(mailRowHtml).join("");
   var list = filteredMails();
   var folderEmpty = {
