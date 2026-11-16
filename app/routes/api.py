@@ -6,7 +6,7 @@ from typing import Optional, Any
 from zoneinfo import ZoneInfo
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, status, Path
 from starlette.datastructures import UploadFile
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 from app.config import settings
 from app.database import (
@@ -163,6 +163,16 @@ class DraftCreateRequest(BaseModel):
     thread_id: Optional[str] = None
     message_id: Optional[str] = None
 
+    @field_validator("to", "cc", "bcc", mode="before")
+    @classmethod
+    def _coerce_address_list(cls, v: Any) -> Any:
+        # HOTFIX 2026-11-16: the compose UI historically sent `to` as a
+        # plain string ("a@b.com, b@c.com"); accept that shape instead
+        # of 422ing. A string is split on commas, like parseAddressList.
+        if isinstance(v, str):
+            return [p.strip() for p in v.split(",") if p.strip()]
+        return v
+
 
 class DraftUpdateRequest(BaseModel):
     to: Optional[list[str]] = None
@@ -172,6 +182,13 @@ class DraftUpdateRequest(BaseModel):
     body: Optional[str] = None
     thread_id: Optional[str] = None
     message_id: Optional[str] = None
+
+    @field_validator("to", "cc", "bcc", mode="before")
+    @classmethod
+    def _coerce_address_list(cls, v: Any) -> Any:
+        if isinstance(v, str):
+            return [p.strip() for p in v.split(",") if p.strip()]
+        return v
 
 class ConfigUpdateRequest(BaseModel):
     schedule: Optional[dict] = None
@@ -603,7 +620,7 @@ def update_mail_labels(mail_id: str, req: LabelRequest):
                 "UPDATE processed_emails SET labels = %s WHERE message_id = %s",
                 (",".join(new_labels), email_record["message_id"]),
             )
-        dashboard_cache.delete("mails")
+        dashboard_cache.delete("summary")
     except Exception as e:
         # Gmail already changed; a local mirror failure is logged, not
         # hidden — the next label sync heals it.
@@ -846,7 +863,7 @@ def update_thread_state(thread_id: str, req: MailStateRequest):
                     update_processed_email_state(message_id_or_pk=msg_id, is_starred=False)
                 updated_ids.update(starred_ids)
 
-    dashboard_cache.delete("mails")
+    dashboard_cache.delete("summary")
     return {"status": "success", "synced_gmail": synced, "updated_count": len(updated_ids)}
 
 
@@ -1126,11 +1143,17 @@ async def compose_and_send(request: Request):
 
 @router.post("/drafts")
 def create_draft_endpoint(req: DraftCreateRequest):
-    """Autosave a new draft (compose or reply)."""
-    to_addrs = _validate_addresses(req.to, "To")
-    cc_addrs = _validate_addresses(req.cc, "Cc")
-    bcc_addrs = _validate_addresses(req.bcc, "Bcc")
-    _check_recipient_cap(0, to_addrs + cc_addrs, bcc_addrs)
+    """Autosave a new draft (compose or reply).
+
+    HOTFIX 2026-11-16: addresses are NOT validated here. Autosave fires
+    while the user is still typing, so a half-typed address (no "@"
+    yet) must not fail the save with a 400 — that was one of the two
+    live autosave failures. Addresses are validated at send time
+    (send_draft_endpoint / compose send), where they have to be final.
+    """
+    to_addrs = list(req.to or [])
+    cc_addrs = list(req.cc or [])
+    bcc_addrs = list(req.bcc or [])
     subject = (req.subject or "").strip()
     body = req.body or ""
     if not to_addrs and not subject and not body.strip():
@@ -1188,14 +1211,18 @@ def get_draft_endpoint(draft_id: int):
 
 @router.put("/drafts/{draft_id}")
 def update_draft_endpoint(draft_id: int, req: DraftUpdateRequest):
-    """Autosave update of a draft (partial: only given fields change)."""
+    """Autosave update of a draft (partial: only given fields change).
+
+    Addresses are not validated here (see create_draft_endpoint):
+    autosave must never fail on a half-typed address.
+    """
     updates: dict = {}
     if req.to is not None:
-        updates["to"] = _validate_addresses(req.to, "To")
+        updates["to"] = list(req.to)
     if req.cc is not None:
-        updates["cc"] = _validate_addresses(req.cc, "Cc")
+        updates["cc"] = list(req.cc)
     if req.bcc is not None:
-        updates["bcc"] = _validate_addresses(req.bcc, "Bcc")
+        updates["bcc"] = list(req.bcc)
     if req.subject is not None:
         updates["subject"] = req.subject.strip()
     if req.body is not None:
@@ -1206,13 +1233,6 @@ def update_draft_endpoint(draft_id: int, req: DraftUpdateRequest):
         updates["thread_id"] = (req.thread_id or "").strip() or None
     if req.message_id is not None:
         updates["message_id"] = (req.message_id or "").strip() or None
-    if "to" in updates or "cc" in updates or "bcc" in updates:
-        # Cap the merged recipient set, not just the changed field.
-        current = get_draft(draft_id) or {}
-        merged_to = updates.get("to", current.get("to", []))
-        merged_cc = updates.get("cc", current.get("cc", []))
-        merged_bcc = updates.get("bcc", current.get("bcc", []))
-        _check_recipient_cap(0, list(merged_to) + list(merged_cc), list(merged_bcc))
     try:
         draft = update_draft(draft_id, updates)
     except Exception as e:
@@ -1265,15 +1285,20 @@ def send_draft_endpoint(draft_id: int):
     body = (draft.get("body") or "").strip()
     if not body:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Draft body is empty; nothing to send.")
-    cc_addrs = draft.get("cc") or []
-    bcc_addrs = draft.get("bcc") or []
+    # Send time is where addresses must be final: validate here, not
+    # at autosave (see create_draft_endpoint). A draft saved with a
+    # half-typed address can only be sent once it is fixed.
+    cc_addrs = _validate_addresses(draft.get("cc") or [], "Cc")
+    bcc_addrs = _validate_addresses(draft.get("bcc") or [], "Bcc")
     try:
         if draft.get("message_id"):
+            _check_recipient_cap(0, cc_addrs, bcc_addrs)
             sent_id = reply_to_email(draft["message_id"], body,
                                      cc_addrs=cc_addrs, bcc_addrs=bcc_addrs)
             thread_id = draft.get("thread_id")
         else:
-            to_addrs = draft.get("to") or []
+            to_addrs = _validate_addresses(draft.get("to") or [], "To")
+            _check_recipient_cap(len(to_addrs), cc_addrs, bcc_addrs)
             if not to_addrs:
                 raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Draft has no recipient; add a To address before sending.")
             subject = (draft.get("subject") or "").strip()
@@ -1340,7 +1365,7 @@ def update_mail_state(mail_id: str, req: MailStateRequest):
         )
 
         # Clear mail cache so UI immediately gets fresh state
-        dashboard_cache.delete("mails")
+        dashboard_cache.delete("summary")
 
         # Sync back to Gmail
         gmail_ok = update_gmail_message_state(
@@ -1412,7 +1437,7 @@ def bulk_update_mail_state(req: BulkStateRequest):
                 is_archived=_local_archived_flag(req),
                 is_trashed=req.is_trash,
             )
-        dashboard_cache.delete("mails")
+        dashboard_cache.delete("summary")
 
     return {
         "status": "success",
@@ -1468,7 +1493,7 @@ def sync_inbox_from_gmail():
     updated_count = int(processed.get("added", 0)) + int(processed.get("deleted", 0)) + int(processed.get("label_changes", 0))
     if result.get("mode") == "initial" or result.get("mode") == "reconciled":
         updated_count = int(result.get("added", 0))
-    dashboard_cache.delete("mails")
+    dashboard_cache.delete("summary")
     return {"status": "success", "updated_count": updated_count, "mode": result.get("mode"), "has_more": result.get("has_more", False)}
 
 # ================= Configuration Endpoints =================

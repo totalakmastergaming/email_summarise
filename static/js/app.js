@@ -19,9 +19,15 @@ var pager = { page: 1, cursors: [null], nextCursor: null, hasMore: false, loadin
    inline error row in the inbox list with a Retry button. */
 var inboxLoadError = null;
 /* Per-folder counts from the last /api/dashboard response
-   (folder_counts map), when the backend provides them. Null = fall
-   back to counting the loaded page for the current folder only. */
+   (folder_counts map), when the backend provides them. Null = no
+   badges (a badge must equal the folder's count, never the loaded
+   page size — HOTFIX 2026-11-16). */
 var FOLDER_COUNTS = null;
+/* True once initBackend has painted #aiBriefText from the latest
+   briefing report; renderStats must not clobber that text with the
+   counts sentence (HOTFIX 2026-11-16 — the two writers disagreed:
+   "15 Emails · 3 Batches" header vs "0 mails today" text). */
+var AI_BRIEF_FROM_REPORT = false;
 /* Attachments: total cap for one message (10 MB, per the Phase 2
    diagnostic — Gmail allows 25 MB, 10 MB bounds free-tier memory). */
 var ATTACH_MAX_TOTAL = 10 * 1024 * 1024;
@@ -244,8 +250,16 @@ function renderStats(){
   $("#statToday").textContent=c.today;
   $("#statUrgent").textContent=c.urgent;
   $("#statReply").textContent=c.reply;
-  $("#navUnread").textContent=c.unread;
-  $("#navUrgent").textContent=c.urgent;
+  /* Sidebar badges come from the server counts only. The page pool
+     must not drive them: merely browsing Archive/Trash/Spam (where
+     activeMails() is empty) drove the Inbox badge to 0, and every
+     folder switch repainted it from a different page (HOTFIX
+     2026-11-16). When the server counts are absent, leave the last
+     known badge alone instead of showing a page-local number. */
+  if(INBOX_COUNTS){
+    $("#navUnread").textContent=c.unread;
+    $("#navUrgent").textContent=c.urgent;
+  }
   renderFolderBadges();
   $("#statUnreadSub").innerHTML = c.unread>0 ? "Across "+totalThreads+" conversations in your inbox" : "Inbox zero — nothing unread";
   $("#statTodaySub").innerHTML = "Since 12:00 AM today · <b>"+pool.filter(function(m){return m.today&&m.unread;}).length+" still unread</b>";
@@ -253,29 +267,39 @@ function renderStats(){
   var firstReply = pool.filter(function(m){return m.needsReply;})[0];
   $("#statUrgentSub").innerHTML = firstUrgent ? "Priority: <b>"+escapeHtml(firstUrgent.subject)+"</b>" : "Nothing marked urgent";
   $("#statReplySub").innerHTML = firstReply ? "Waiting from: <b>"+escapeHtml(firstReply.sender)+"</b>" : "No one is waiting on you";
-  /* AI brief */
-  $("#aiBriefText").innerHTML = "You received <b>"+c.today+" mails today</b>. <b>"+c.urgent+" are urgent</b> and <b>"+c.reply+" threads are waiting for your reply.</b>";
-  var pts=[];
-  pool.filter(function(m){return m.urgent;}).slice(0,3).forEach(function(m){
-    pts.push("<li><span class='dot'></span><span><b>"+escapeHtml(m.sender)+":</b> "+escapeHtml((m.summary||"").split(".")[0])+".</span></li>");
-  });
-  var extra = pool.filter(function(m){return m.needsReply && !m.urgent;});
-  if(extra.length) pts.push("<li><span class='dot'></span><span>Also awaiting a reply: <b>"+extra.map(function(m){return escapeHtml(m.sender);}).join(", ")+"</b>.</span></li>");
-  $("#aiBriefPoints").innerHTML = pts.join("");
+  /* AI brief: when initBackend painted the latest briefing report
+     into #aiBriefText, keep it — the counts sentence below is the
+     fallback for when no briefing exists. Previously renderStats
+     unconditionally overwrote the briefing on every page load, so the
+     dashboard showed the report's header ("15 Emails · 3 Batches")
+     next to the counts sentence ("0 mails today") (HOTFIX 2026-11-16).
+     The two numbers may still legitimately differ: the header is the
+     last pipeline run's totals over its configured range, while the
+     counts sentence (and the stat boxes) are today-in-IST. */
+  if(!AI_BRIEF_FROM_REPORT){
+    $("#aiBriefText").innerHTML = "You received <b>"+c.today+" mails today</b>. <b>"+c.urgent+" are urgent</b> and <b>"+c.reply+" threads are waiting for your reply.</b>";
+    var pts=[];
+    pool.filter(function(m){return m.urgent;}).slice(0,3).forEach(function(m){
+      pts.push("<li><span class='dot'></span><span><b>"+escapeHtml(m.sender)+":</b> "+escapeHtml((m.summary||"").split(".")[0])+".</span></li>");
+    });
+    var extra = pool.filter(function(m){return m.needsReply && !m.urgent;});
+    if(extra.length) pts.push("<li><span class='dot'></span><span>Also awaiting a reply: <b>"+extra.map(function(m){return escapeHtml(m.sender);}).join(", ")+"</b>.</span></li>");
+    $("#aiBriefPoints").innerHTML = pts.join("");
+  }
 }
 /* Sidebar folder badges from the dashboard folder_counts map. When
-   the backend does not provide it, only the currently loaded folder
-   shows a count (the loaded page size) — other folders show no badge
-   rather than a made-up number. */
+   the backend does not provide it, no folder shows a badge rather
+   than a made-up number. */
 function renderFolderBadges(){
   var folders = ["sent", "drafts", "archive", "trash", "spam"];
-  var cur = (typeof currentFolder === "function") ? currentFolder() : "inbox";
   folders.forEach(function(f){
     var el = document.getElementById("nav" + f.charAt(0).toUpperCase() + f.slice(1));
     if(!el) return;
     var n = null;
     if(FOLDER_COUNTS && FOLDER_COUNTS[f] != null) n = FOLDER_COUNTS[f];
-    else if(f === cur && MAILS) n = MAILS.length;
+    /* No page-size fallback: showing MAILS.length as the badge made
+       it read "19" while Archive was open and vanish on leaving it
+       (HOTFIX 2026-11-16). No server count = no badge. */
     if(n == null || n === 0){ el.hidden = true; }
     else { el.hidden = false; el.textContent = n; }
   });
@@ -848,6 +872,13 @@ $("#navScrim").addEventListener("click",function(){ $("#sidebar").classList.remo
 function setFilter(f){
   state.filter=f;
   state.selected={};
+  /* HOTFIX 2026-11-16: drop the previous folder's rows NOW, before the
+     fetch lands. filteredMails() has no folder predicate — folder
+     scoping is server-side only — so painting from the stale pool
+     showed Sent's rows under the Drafts header until the new fetch
+     arrived (or forever, if it failed). */
+  MAILS = [];
+  SEARCH_RESULTS = null;
   /* Folder change resets pagination to page 1 and reloads from the server. */
   resetPager();
   renderLists();
@@ -857,6 +888,11 @@ function setCategory(c){
   state.cat=c;
   state.filter="all";
   state.selected={};
+  /* Same stale-pool drop as setFilter (HOTFIX 2026-11-16): the old
+     tab's rows must not paint under the new tab while its fetch is
+     in flight. */
+  MAILS = [];
+  SEARCH_RESULTS = null;
   /* Category-tab change resets pagination to page 1 and reloads. */
   resetPager();
   renderLists();
@@ -936,6 +972,13 @@ function draftRowFromDraft(d){
 async function fetchDraftsPage(cursor){
   if(pager.loading){ pagePending = cursor; return "queued"; }
   pager.loading = true;
+  /* HOTFIX 2026-11-16: remember which view this fetch belongs to; a
+     landing after the user switched views must not overwrite the new
+     view's list (or repaint the old view's error into it). A fresh
+     attempt also clears the previous error while it loads. */
+  var fetchFolder = currentFolder(), fetchQuery = state.query;
+  pager.error = null;
+  inboxLoadError = null;
   renderGmailChrome();
   var status = 0;
   try {
@@ -951,6 +994,9 @@ async function fetchDraftsPage(cursor){
     if(!res.ok || (d.status && d.status !== "success") || list === null){
       throw new Error((d && d.detail) || ("Couldn't load drafts (" + res.status + ")"));
     }
+    if(currentFolder() !== fetchFolder || state.query !== fetchQuery){
+      return "stale"; /* View changed mid-flight; the queued fetch owns the list. */
+    }
     MAILS = list.map(draftRowFromDraft);
     SEARCH_RESULTS = null;
     pager.nextCursor = d.next_cursor || null;
@@ -965,6 +1011,9 @@ async function fetchDraftsPage(cursor){
       inboxLoadError = null;
       renderAll();
       return false;
+    }
+    if(currentFolder() !== fetchFolder || state.query !== fetchQuery){
+      return "stale"; /* Stale failure: never paint it into the new view. */
     }
     var msg = (e && e.message) || "Couldn't load drafts";
     pager.error = msg;
@@ -987,6 +1036,10 @@ async function fetchPage(cursor){
      racing it — the queue drains in order once the flight lands. */
   if(pager.loading){ pagePending = cursor; return "queued"; }
   pager.loading = true;
+  /* HOTFIX 2026-11-16: same stale-landing guard as fetchDraftsPage. */
+  var fetchFolder = currentFolder(), fetchCat = state.cat, fetchQuery = state.query;
+  pager.error = null;
+  inboxLoadError = null;
   renderGmailChrome();
   var isSearch = !!state.query.trim();
   var status = 0;
@@ -996,6 +1049,9 @@ async function fetchPage(cursor){
     var d = await res.json().catch(function(){ return {}; });
     if(!res.ok || d.status !== "success" || !Array.isArray(d.mails)){
       throw new Error((d && d.detail) || ("Couldn't load mail (" + res.status + ")"));
+    }
+    if(currentFolder() !== fetchFolder || state.cat !== fetchCat || state.query !== fetchQuery){
+      return "stale"; /* View changed mid-flight; the queued fetch owns the list. */
     }
     var rows = d.mails.map(normaliseThreadRow);
     if(isSearch){ SEARCH_RESULTS = rows; }
@@ -1016,6 +1072,9 @@ async function fetchPage(cursor){
       inboxLoadError = null;
       renderAll();
       return false;
+    }
+    if(currentFolder() !== fetchFolder || state.cat !== fetchCat || state.query !== fetchQuery){
+      return "stale"; /* Stale failure: never paint it into the new view. */
     }
     var msg = (e && e.message) || "Couldn't load this page";
     pager.error = msg;
@@ -1520,7 +1579,11 @@ function showForwardNote(){
 /* ---- Draft autosave ---- */
 function composeDraftPayload(){
   return {
-    to: $("#cTo") ? $("#cTo").value.trim() : "",
+    /* HOTFIX 2026-11-16: `to` was a plain string here while
+       DraftCreateRequest expects a list — Pydantic 422'd every
+       autosave, so the header always showed "Couldn't save draft —
+       retry". cc/bcc already used parseAddressList. */
+    to: parseAddressList($("#cTo") ? $("#cTo").value : ""),
     cc: parseAddressList($("#cCc") ? $("#cCc").value : ""),
     bcc: parseAddressList($("#cBcc") ? $("#cBcc").value : ""),
     subject: $("#cSubject") ? $("#cSubject").value.trim() : "",
@@ -1529,7 +1592,7 @@ function composeDraftPayload(){
 }
 function composeIsEmpty(){
   var p = composeDraftPayload();
-  return !p.to && !p.cc.length && !p.bcc.length && !p.subject && !p.body.trim() && !composeAttachments.length;
+  return !p.to.length && !p.cc.length && !p.bcc.length && !p.subject && !p.body.trim() && !composeAttachments.length;
 }
 function setDraftStatus(state, when){
   draftSaveState = state;
@@ -2023,6 +2086,13 @@ async function initBackend(){
     var fc = data.folder_counts || (data.data && data.data.folder_counts)
       || (INBOX_COUNTS && INBOX_COUNTS.folder_counts);
     if(fc) FOLDER_COUNTS = fc;
+    /* HOTFIX 2026-11-16: paint the stats/badges from the counts just
+       fetched, NOW — previously renderStats only ran after the first
+       inbox page loaded, so with the Primary fetch broken the
+       dashboard kept the boot-time zeros even though the counts had
+       arrived. */
+    AI_BRIEF_FROM_REPORT = false;
+    renderAll();
     if(data.status === "success" || data.status === "warning"){
       var cfg = data.config || {};
       if(cfg.model){
@@ -2051,6 +2121,10 @@ async function initBackend(){
         if(briefEl){
           var briefTxt = String(latest.summary_markdown).slice(0, 320) + (String(latest.summary_markdown).length > 320 ? "\u2026" : "");
           briefEl.innerHTML = "<b>Today's Briefing:</b> " + escapeHtml(briefTxt);
+          /* Mark the briefing as the brief panel's content so the
+             next renderStats() does not overwrite it with the counts
+             sentence (HOTFIX 2026-11-16). */
+          AI_BRIEF_FROM_REPORT = true;
         }
         if(latest.action_items){
           var items = null;

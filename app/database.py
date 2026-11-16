@@ -465,29 +465,50 @@ _URGENT_SUBJECT_LIKES = ["%urgent%", "%action required%", "%deadline%", "%immedi
 # checks unread + Primary category + a non-automated-looking sender and
 # subject. The Python helper remains the source of truth for a single
 # row; this fragment exists so folders/counts can be computed in SQL.
-_NEEDS_REPLY_SQL = """(
-    is_unread = TRUE
-    AND COALESCE(labels, '') NOT LIKE '%CATEGORY_SOCIAL%'
-    AND COALESCE(labels, '') NOT LIKE '%CATEGORY_PROMOTIONS%'
-    AND COALESCE(labels, '') NOT LIKE '%CATEGORY_UPDATES%'
-    AND COALESCE(labels, '') NOT LIKE '%CATEGORY_FORUMS%'
-    AND COALESCE(sender, '') NOT LIKE '%noreply%'
-    AND COALESCE(sender, '') NOT LIKE '%no-reply%'
-    AND COALESCE(sender, '') NOT LIKE '%donotreply%'
-    AND COALESCE(sender, '') NOT LIKE '%do-not-reply%'
-    AND COALESCE(sender, '') NOT LIKE '%notification%'
-    AND COALESCE(sender, '') NOT LIKE '%digest%'
-    AND COALESCE(sender, '') NOT LIKE '%updates@%'
-    AND COALESCE(sender, '') NOT LIKE '%newsletter%'
-    AND COALESCE(subject, '') NOT LIKE '%newsletter%'
-    AND COALESCE(subject, '') NOT LIKE '%digest%'
-    AND COALESCE(subject, '') NOT LIKE '%notification only%'
-    AND COALESCE(subject, '') NOT LIKE '%unsubscribe%'
-    AND COALESCE(subject, '') NOT LIKE '%your receipt%'
-    AND COALESCE(subject, '') NOT LIKE '%order confirmed%'
-    AND COALESCE(subject, '') NOT LIKE '%password reset%'
-    AND COALESCE(subject, '') NOT LIKE '%verify your%'
-)"""
+#
+# HOTFIX 2026-11-16: the patterns MUST be bound params, never inlined
+# into the SQL string. PyMySQL executes queries as ``query % params``,
+# so a literal '%…%' in the SQL is read as a %-format specifier and
+# raises ValueError ("unsupported format character 'C' (0x43) at index
+# 855" — live, Primary tab + dashboard/folder counts). The old constant
+# _NEEDS_REPLY_SQL inlined all 20 patterns and broke every query that
+# used it (get_inbox_counts, get_folder_counts, folder=reply).
+_NEEDS_REPLY_PATTERNS = [
+    ("labels", "%CATEGORY_SOCIAL%"),
+    ("labels", "%CATEGORY_PROMOTIONS%"),
+    ("labels", "%CATEGORY_UPDATES%"),
+    ("labels", "%CATEGORY_FORUMS%"),
+    ("sender", "%noreply%"),
+    ("sender", "%no-reply%"),
+    ("sender", "%donotreply%"),
+    ("sender", "%do-not-reply%"),
+    ("sender", "%notification%"),
+    ("sender", "%digest%"),
+    ("sender", "%updates@%"),
+    ("sender", "%newsletter%"),
+    ("subject", "%newsletter%"),
+    ("subject", "%digest%"),
+    ("subject", "%notification only%"),
+    ("subject", "%unsubscribe%"),
+    ("subject", "%your receipt%"),
+    ("subject", "%order confirmed%"),
+    ("subject", "%password reset%"),
+    ("subject", "%verify your%"),
+]
+
+
+def _needs_reply_sql(alias: str = "p") -> tuple[str, list[str]]:
+    """(SQL, params) for the needs-reply heuristic on one row.
+
+    Columns are qualified with ``alias`` (the latest-message alias in
+    every caller); patterns are bound params, never inlined.
+    """
+    a = f"{alias}." if alias else ""
+    parts = [f"{a}is_unread = TRUE"]
+    parts.extend(
+        f"COALESCE({a}{col}, '') NOT LIKE %s" for col, _ in _NEEDS_REPLY_PATTERNS
+    )
+    return "(" + " AND ".join(parts) + ")", [pat for _, pat in _NEEDS_REPLY_PATTERNS]
 
 
 def _urgent_subject_sql(alias: str = "") -> str:
@@ -664,9 +685,8 @@ def _folder_predicate_sql(folder: str, alias: str = "p") -> tuple[str, list[Any]
     if folder == "urgent":
         return f"{_urgent_subject_sql(a)} AND {inbox_base}", list(_URGENT_SUBJECT_LIKES)
     if folder == "reply":
-        # _NEEDS_REPLY_SQL is unaliased; it resolves to `p` because no
-        # other table in these queries carries those columns.
-        return f"{_NEEDS_REPLY_SQL} AND {inbox_base}", []
+        needs_sql, needs_params = _needs_reply_sql(a)
+        return f"{needs_sql} AND {inbox_base}", needs_params
     if folder == "all":
         return _label_absent("TRASH", a), []
     raise ValueError(f"Unknown folder: {folder}")
@@ -685,23 +705,35 @@ def get_inbox_counts() -> dict:
     inbox category tabs. Message-level sums (unread/today/urgent/
     needs_reply) use the same INBOX base; total_threads counts
     distinct threads.
+
+    HOTFIX 2026-11-16: all five numbers are now computed over the
+    thread's LATEST message only (same latest-message subquery as
+    list_threads/get_folder_counts). Previously the four sums ran over
+    every message row while total_threads counted threads, so e.g.
+    unread could exceed total_threads and disagree with the bold rows
+    the inbox actually shows (a thread's row carries its latest
+    message's flags). Now unread = threads whose latest message is
+    unread, today/urgent/needs_reply likewise — one ground truth.
     """
     from zoneinfo import ZoneInfo
 
     today_ist = datetime.now(ZoneInfo("Asia/Kolkata")).date()
+    needs_sql, needs_params = _needs_reply_sql("p")
     with get_db_cursor() as cur:
         cur.execute(
             f"""
             SELECT
-                COALESCE(SUM(CASE WHEN is_unread THEN 1 ELSE 0 END), 0) AS unread,
-                COALESCE(SUM(CASE WHEN DATE(CONVERT_TZ(received_at, '+00:00', '+05:30')) = %s THEN 1 ELSE 0 END), 0) AS today,
-                COALESCE(SUM(CASE WHEN {_urgent_subject_sql()} THEN 1 ELSE 0 END), 0) AS urgent,
-                COALESCE(SUM(CASE WHEN {_NEEDS_REPLY_SQL} THEN 1 ELSE 0 END), 0) AS needs_reply,
-                COUNT(DISTINCT COALESCE(thread_id, message_id)) AS total_threads
+                COALESCE(SUM(CASE WHEN p.is_unread THEN 1 ELSE 0 END), 0) AS unread,
+                COALESCE(SUM(CASE WHEN DATE(CONVERT_TZ(p.received_at, '+00:00', '+05:30')) = %s THEN 1 ELSE 0 END), 0) AS today,
+                COALESCE(SUM(CASE WHEN {_urgent_subject_sql("p")} THEN 1 ELSE 0 END), 0) AS urgent,
+                COALESCE(SUM(CASE WHEN {needs_sql} THEN 1 ELSE 0 END), 0) AS needs_reply,
+                COUNT(*) AS total_threads
             FROM processed_emails p
+            JOIN (SELECT COALESCE(thread_id, message_id) AS tkey, MAX(id) AS max_id
+                  FROM processed_emails GROUP BY tkey) latest ON p.id = latest.max_id
             WHERE {_label_present('INBOX')} AND {_label_absent('TRASH')} AND {_label_absent('SPAM')}
             """,
-            (today_ist, *_URGENT_SUBJECT_LIKES),
+            (today_ist, *_URGENT_SUBJECT_LIKES, *needs_params),
         )
         row = cur.fetchone() or {}
     return {
@@ -842,12 +874,16 @@ def list_threads(folder: str = "inbox", cat: Optional[str] = None,
         # counts as primary, matching _category_from_labels).
         # COALESCE: a NULL labels value must count as "no category",
         # not silently drop the row (NULL NOT LIKE is NULL in MySQL).
-        cat_sql = (
-            " AND COALESCE(p.labels, '') NOT LIKE '%CATEGORY_SOCIAL%'"
-            " AND COALESCE(p.labels, '') NOT LIKE '%CATEGORY_PROMOTIONS%'"
-            " AND COALESCE(p.labels, '') NOT LIKE '%CATEGORY_UPDATES%'"
-            " AND COALESCE(p.labels, '') NOT LIKE '%CATEGORY_FORUMS%'"
+        # HOTFIX 2026-11-16: the patterns are bound params, never
+        # inlined — PyMySQL executes queries as ``query % params``, so
+        # the old literal '%CATEGORY_SOCIAL%' raised ValueError
+        # ("unsupported format character 'C' (0x43) at index 855")
+        # and broke the Primary tab on every fetch. The other
+        # categories already used bound params (see above).
+        cat_sql = " AND " + " AND ".join(
+            "COALESCE(p.labels, '') NOT LIKE %s" for _ in _CAT_LABEL
         )
+        params.extend(f"%{label}%" for label in _CAT_LABEL.values())
 
     q_sql = ""
     if q:

@@ -126,6 +126,11 @@ class FakeCursor:
         params = params if params is not None else ()
         assert sql.count("%s") == len(params), (
             f"placeholder/param mismatch: {sql.count('%s')} vs {len(params)}\n{sql}\n{params}")
+        # HOTFIX 2026-11-16: PyMySQL-faithful check — see
+        # tests/test_phase2.py FakeCursor. A literal '%…%' in the SQL
+        # string raises ValueError under ``query % args`` even when the
+        # %s count matches; dummy replacements catch it offline.
+        sql % tuple("'x'" for _ in params)
         self.executed.append((sql, params))
 
     def executemany(self, sql, values):
@@ -481,10 +486,16 @@ class TestListThreadsSQL:
 
     def test_primary_uses_coalesce_for_null_labels(self, monkeypatch):
         fake, _, _, _ = self._run(monkeypatch, folder="inbox", cat="primary")
-        assert "COALESCE(p.labels, '') NOT LIKE '%CATEGORY_SOCIAL%'" in fake.sql
-        assert "COALESCE(p.labels, '') NOT LIKE '%CATEGORY_PROMOTIONS%'" in fake.sql
-        assert "COALESCE(p.labels, '') NOT LIKE '%CATEGORY_UPDATES%'" in fake.sql
-        assert "COALESCE(p.labels, '') NOT LIKE '%CATEGORY_FORUMS%'" in fake.sql
+        # HOTFIX 2026-11-16: the patterns are bound params now (the old
+        # inlined '%CATEGORY…%' literals broke PyMySQL's ``query %
+        # params`` with ValueError). COALESCE form is unchanged.
+        assert fake.sql.count("COALESCE(p.labels, '') NOT LIKE %s") == 4
+        # Params run folder, category, search, cursor, limit — the four
+        # category patterns come first here (inbox has no folder params).
+        assert tuple(fake.params[:4]) == ("%CATEGORY_SOCIAL%",
+                                          "%CATEGORY_PROMOTIONS%",
+                                          "%CATEGORY_UPDATES%",
+                                          "%CATEGORY_FORUMS%")
         # NULL-semantics proof: in MySQL, NULL NOT LIKE '...' is NULL
         # (row dropped); COALESCE(NULL,'') NOT LIKE '...' is TRUE (row kept).
         # The SQL above is exactly the COALESCE form, so a NULL-labels row
@@ -507,7 +518,14 @@ class TestListThreadsSQL:
         assert counts == {"unread": 1, "today": 2, "urgent": 0,
                           "needs_reply": 1, "total_threads": 9}
         assert "CONVERT_TZ" in fake.sql
-        assert "COUNT(DISTINCT COALESCE(thread_id, message_id))" in fake.sql
+        # HOTFIX 2026-11-16: counts run over the thread's LATEST message
+        # only (same subquery as list_threads), so the sums and the
+        # thread total share one ground truth; the old message-level
+        # COUNT(DISTINCT ...) let unread exceed total_threads.
+        assert "MAX(id)" in fake.sql
+        assert "GROUP BY tkey" in fake.sql
+        assert "COUNT(*)" in fake.sql
+        assert "COUNT(DISTINCT COALESCE(thread_id, message_id))" not in fake.sql
 
 # ------------------------------------------------------------------
 # 3. Threading (API level)

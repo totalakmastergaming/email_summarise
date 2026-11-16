@@ -163,6 +163,14 @@ class FakeCursor:
         params = params if params is not None else ()
         assert sql.count("%s") == len(params), (
             f"placeholder/param mismatch: {sql.count('%s')} vs {len(params)}\n{sql}\n{params}")
+        # HOTFIX 2026-11-16: PyMySQL-faithful check. Cursor.execute runs
+        # ``query % escaped_args`` (pymysql/cursors.py mogrify), so a
+        # literal '%…%' in the SQL string raises ValueError even when
+        # the %s count matches — that is exactly how the Primary tab
+        # and the counts broke live while 139/139 tests passed. Dummy
+        # replacements stand in for the escaped args; any stray '%'
+        # fails here the same way it fails on Render.
+        sql % tuple("'x'" for _ in params)
         self.executed.append((sql, params))
 
     def executemany(self, sql, values):
@@ -610,7 +618,13 @@ class TestCountsSQL:
         # The old unfiltered base (flags, no INBOX test) is gone.
         assert "is_archived = FALSE" not in fake.sql
         assert "is_trashed = FALSE" not in fake.sql
-        assert "COUNT(DISTINCT COALESCE(thread_id, message_id))" in fake.sql
+        # HOTFIX 2026-11-16: counts run over the thread's LATEST message
+        # only (same subquery as list_threads), so the sums and the
+        # thread total share one ground truth.
+        assert "MAX(id)" in fake.sql
+        assert "GROUP BY tkey" in fake.sql
+        assert "COUNT(*)" in fake.sql
+        assert "COUNT(DISTINCT COALESCE(thread_id, message_id))" not in fake.sql
 
     def test_get_folder_counts_uses_same_predicates_as_list(self, monkeypatch):
         counts_row = {"inbox": 5, "sent": 2, "drafts": 1, "archive": 3,
@@ -865,9 +879,17 @@ class TestDraftsAPI:
         assert api_client.drafts.rows == {}
 
     def test_create_bad_address_400(self, api_client, auth_headers):
+        # HOTFIX 2026-11-16: addresses are no longer validated at
+        # autosave time — a draft with a half-typed address must save
+        # (it failed live with "Couldn't save draft — retry").
+        # Validation moved to send time instead.
         r = api_client.post("/api/drafts", headers=auth_headers, json={
             "to": ["not-an-email"], "body": "x"})
+        assert r.status_code == 200, r.text
+        r = api_client.post("/api/drafts/1/send", headers=auth_headers)
         assert r.status_code == 400, r.text
+        # The draft survives the failed send, so it can be fixed.
+        assert api_client.get("/api/drafts/1", headers=auth_headers).status_code == 200
 
     def test_create_reply_draft_keeps_thread_refs(self, api_client, auth_headers):
         r = api_client.post("/api/drafts", headers=auth_headers, json={
@@ -1144,13 +1166,19 @@ class TestCCBCCAndFormData:
             "to": "a@b.com", "subject": "s", "body": "b",
             "cc": cc[:19]})
         assert r.status_code == 200, r.text  # 1 + 19 = 20, at the cap
-        # Drafts enforce the same cap across To+Cc+Bcc.
+        # HOTFIX 2026-11-16: drafts do NOT enforce the cap at save time
+        # — autosave must never fail while the user is still typing
+        # recipients. The cap is enforced at send time instead.
         r = api_client.post("/api/drafts", headers=auth_headers, json={
             "to": cc, "cc": ["extra@x.com"], "subject": "s", "body": "b"})
-        assert r.status_code == 400, r.text  # 20 + 1 = 21
+        assert r.status_code == 200, r.text  # 20 + 1 = 21: savable, not sendable
+        r = api_client.post("/api/drafts/1/send", headers=auth_headers)
+        assert r.status_code == 400, r.text  # 20 + 1 = 21 over the cap
         r = api_client.post("/api/drafts", headers=auth_headers, json={
             "to": cc, "subject": "s", "body": "b"})
         assert r.status_code == 200, r.text  # exactly 20 is allowed
+        r = api_client.post("/api/drafts/2/send", headers=auth_headers)
+        assert r.status_code == 200, r.text  # exactly 20 sends fine
         assert len(api_client.drafts.rows) == 1
 
 # ------------------------------------------------------------------
